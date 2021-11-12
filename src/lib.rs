@@ -1,3 +1,75 @@
+#![deny(
+    clippy::suspicious,
+    clippy::style,
+    missing_debug_implementations,
+    missing_copy_implementations,
+    rustdoc::broken_intra_doc_links
+)]
+#![warn(clippy::pedantic, clippy::cargo, missing_docs)]
+
+//! A simple threadpool for data-parallel concurrency.
+//!
+//! This crate is designed to parallelize breadth-first queue processing
+//! operations, such as the following:
+//!
+//! ```
+//! # use std::collections::VecDeque;
+//! # #[derive(Debug, Clone, Copy)] struct FooData;
+//! # #[derive(Debug, Clone, Copy)] struct BarData;
+//! # const initial_data: FooData = FooData;
+//! # fn process_foo(_: FooData) -> BarData { BarData }
+//! #
+//! enum Job {
+//!     Foo(FooData),
+//!     Bar(BarData),
+//! }
+//!
+//! let mut q = VecDeque::new();
+//!
+//! q.push_back(Job::Foo(initial_data));
+//!
+//! while let Some(job) = q.pop_front() {
+//!     match job {
+//!         Job::Foo(foo) => {
+//!             let bar = process_foo(foo);
+//!             q.push_back(Job::Bar(bar));
+//!         },
+//!         Job::Bar(bar) => {
+//!             println!("Bar: {:?}", bar);
+//!         },
+//!     }
+//! }
+//! ```
+//!
+//! Using `baby_pool`, the above can be written to use a threadpool like so:
+//!
+//! ```
+//! # use std::collections::VecDeque;
+//! # use baby_pool::ThreadPool;
+//! # #[derive(Debug, Clone, Copy)] struct FooData;
+//! # #[derive(Debug, Clone, Copy)] struct BarData;
+//! # const initial_data: FooData = FooData;
+//! # fn process_foo(_: FooData) -> BarData { BarData }
+//! #
+//! # enum Job {
+//! #     Foo(FooData),
+//! #     Bar(BarData),
+//! # }
+//! let pool = ThreadPool::new(None, |job, handle| match job {
+//!     Job::Foo(foo) => {
+//!         let bar = process_foo(foo);
+//!         handle.push(Job::Bar(bar));
+//!     },
+//!     Job::Bar(bar) => {
+//!         // NOTE: this should be synchronized with a mutex
+//!         println!("Bar: {:?}", bar);
+//!     },
+//! });
+//!
+//! pool.push(Job::Foo(initial_data));
+//! pool.join();
+//! ```
+
 use std::{
     panic::{AssertUnwindSafe, RefUnwindSafe, UnwindSafe},
     sync::{
@@ -20,6 +92,7 @@ fn defer_abort() -> dispose::Disposable<impl FnOnce()> {
     })
 }
 
+#[derive(Debug)]
 struct ThreadPoolCore<J> {
     inj: Injector<J>,
     steal: Box<[Stealer<J>]>,
@@ -29,7 +102,18 @@ struct ThreadPoolCore<J> {
     stop: AtomicBool,
 }
 
+/// Thread-safe view into a thread pool, for access by running jobs.
+///
+/// This view allows you to push additional jobs, but does not expose any
+/// functionality that could interfere with a running thread pool.
+#[derive(Debug)]
 pub struct ThreadPoolHandle<'a, J>(AssertUnwindSafe<&'a Arc<ThreadPoolCore<J>>>);
+
+/// Container and main executor for a FIFO thread pool.
+///
+/// Creating an instance of `ThreadPool` will spawn and park all the threads
+/// necessary, and jobs will begin running as they are pushed.
+#[derive(Debug)]
 pub struct ThreadPool<J>(Arc<ThreadPoolCore<J>>, Vec<JoinHandle<()>>);
 
 impl<J> ThreadPoolCore<J> {
@@ -80,12 +164,18 @@ impl<J> ThreadPoolCore<J> {
 }
 
 impl<'a, J> ThreadPoolHandle<'a, J> {
+    /// Push `job` onto the end of the work queue for this thread pool.
     pub fn push(&self, job: J) {
         self.0.push(job);
     }
 }
 
 impl<J: Send + UnwindSafe + 'static> ThreadPool<J> {
+    /// Construct a new thread pool and spawn the worker threads.
+    ///
+    /// If no value is provided for `num_threads`, the number of detected CPU
+    /// cores on the system will be used.
+    ///
     /// # Panics
     /// This function panics and aborts the process if a thread cannot be created successfully.
     pub fn new(
@@ -124,7 +214,7 @@ impl<J: Send + UnwindSafe + 'static> ThreadPool<J> {
                         let core = core.clone();
                         let f = f.clone();
 
-                        move || WorkerThread { index, work, core }.run(f)
+                        move || WorkerThread { /* index, */ work, core }.run(f)
                     })
                     .unwrap()
             })
@@ -137,39 +227,55 @@ impl<J: Send + UnwindSafe + 'static> ThreadPool<J> {
 }
 
 impl<J> ThreadPool<J> {
+    /// Push `job` onto the end of the work queue for this thread pool.
     #[inline]
     pub fn push(&self, job: J) {
         self.0.push(job);
     }
 
+    fn join_threads(&mut self) {
+        for handle in self.1.drain(..) {
+            handle.join().unwrap();
+        }
+    }
+
+    /// Wait for all currently-running jobs (and any jobs queued as a result of
+    /// currently-running jobs) to finish processing and terminate all
+    /// associated threads.
+    ///
     /// # Panics
     /// This function panics if any of the threads in this pool have panicked
     /// without already aborting the process.
     pub fn join(mut self) {
         self.0.join();
-
-        for handle in self.1.drain(..) {
-            handle.join().unwrap();
-        }
+        self.join_threads();
 
         // Final sanity check
         assert!(self.0.is_empty(), "Thread pool starved!");
     }
 
+    /// Stop processing new jobs and terminate the associated threads after all
+    /// current jobs are done.
+    ///
+    /// # Panics
+    /// This function panics if any of the threads in this pool have panicked
+    /// without already aborting the process.
     #[inline]
-    pub fn abort(&self) {
+    pub fn abort(mut self) {
         self.0.abort();
+        self.join_threads();
     }
 }
 
 impl<J> Drop for ThreadPool<J> {
     fn drop(&mut self) {
-        self.abort();
+        self.0.abort();
     }
 }
 
 struct WorkerThread<J> {
-    index: usize,
+    // Might expose in the future
+    // index: usize,
     work: Worker<J>,
     core: Arc<ThreadPoolCore<J>>,
 }
