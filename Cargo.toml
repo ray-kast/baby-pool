@@ -1,6 +1,6 @@
 [package]
 name = "baby-pool"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["raykast <rookie1286@gmail.com>"]
 edition = "2021"
 description = "A miniscule thread pool built on crossbeam's scheduler"
@@ -15,7 +15,7 @@ categories = ["algorithms", "concurrency", "rust-patterns"]
 
 [dependencies]
 crossbeam = "0.8.1"
-dispose = "0.3.1"
+dispose = "0.4.0"
 log = "0.4.14"
 num_cpus = "1.13.0"
 parking_lot = "0.11.2"

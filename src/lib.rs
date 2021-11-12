@@ -79,18 +79,9 @@ use std::{
     thread::JoinHandle,
 };
 
-// TODO: document
-
 use crossbeam::deque::{Injector, Steal, Stealer, Worker};
+use dispose::abort_on_panic;
 use parking_lot::{Condvar, Mutex};
-
-/// Crash if a panic escapes confinement
-#[must_use = "Pass the returned value to mem::forget to prevent aborting if no panic occurred"]
-fn defer_abort() -> dispose::Disposable<impl FnOnce()> {
-    dispose::defer(|| {
-        std::process::abort();
-    })
-}
 
 #[derive(Debug)]
 struct ThreadPoolCore<J> {
@@ -118,9 +109,7 @@ pub struct ThreadPool<J>(Arc<ThreadPoolCore<J>>, Vec<JoinHandle<()>>);
 
 impl<J> ThreadPoolCore<J> {
     /// **NOTE:** Use with care!  This is not atomic.
-    fn is_empty(&self) -> bool {
-        self.inj.is_empty() && self.steal.iter().all(Stealer::is_empty)
-    }
+    fn is_empty(&self) -> bool { self.inj.is_empty() && self.steal.iter().all(Stealer::is_empty) }
 
     fn park(&self) {
         if self.stop.load(Ordering::SeqCst) {
@@ -165,9 +154,7 @@ impl<J> ThreadPoolCore<J> {
 
 impl<'a, J> ThreadPoolHandle<'a, J> {
     /// Push `job` onto the end of the work queue for this thread pool.
-    pub fn push(&self, job: J) {
-        self.0.push(job);
-    }
+    pub fn push(&self, job: J) { self.0.push(job); }
 }
 
 impl<J: Send + UnwindSafe + 'static> ThreadPool<J> {
@@ -177,7 +164,8 @@ impl<J: Send + UnwindSafe + 'static> ThreadPool<J> {
     /// cores on the system will be used.
     ///
     /// # Panics
-    /// This function panics and aborts the process if a thread cannot be created successfully.
+    /// This function panics and aborts the process if a thread cannot be
+    /// created successfully.
     pub fn new(
         num_threads: impl Into<Option<usize>>,
         f: impl Fn(J, ThreadPoolHandle<J>) + Send + Clone + RefUnwindSafe + 'static,
@@ -203,24 +191,31 @@ impl<J: Send + UnwindSafe + 'static> ThreadPool<J> {
             join_var: Condvar::new(),
         });
 
-        let abort = defer_abort();
+        let threads = abort_on_panic({
+            let core = &core;
+            move || {
+                work.into_iter()
+                    .map(|(index, work)| {
+                        std::thread::Builder::new()
+                            .name(format!("Worker thread {}", index))
+                            .spawn({
+                                let core = core.clone();
+                                let f = f.clone();
 
-        let threads = work
-            .into_iter()
-            .map(|(index, work)| {
-                std::thread::Builder::new()
-                    .name(format!("Worker thread {}", index))
-                    .spawn({
-                        let core = core.clone();
-                        let f = f.clone();
-
-                        move || WorkerThread { /* index, */ work, core }.run(f)
+                                move || {
+                                    WorkerThread {
+                                        /* index, */
+                                        work,
+                                        core,
+                                    }
+                                    .run(f);
+                                }
+                            })
+                            .unwrap()
                     })
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-
-        std::mem::forget(abort);
+                    .collect::<Vec<_>>()
+            }
+        });
 
         Self(core, threads)
     }
@@ -229,9 +224,7 @@ impl<J: Send + UnwindSafe + 'static> ThreadPool<J> {
 impl<J> ThreadPool<J> {
     /// Push `job` onto the end of the work queue for this thread pool.
     #[inline]
-    pub fn push(&self, job: J) {
-        self.0.push(job);
-    }
+    pub fn push(&self, job: J) { self.0.push(job); }
 
     fn join_threads(&mut self) {
         for handle in self.1.drain(..) {
@@ -268,9 +261,7 @@ impl<J> ThreadPool<J> {
 }
 
 impl<J> Drop for ThreadPool<J> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
+    fn drop(&mut self) { self.0.abort(); }
 }
 
 struct WorkerThread<J> {
@@ -309,20 +300,18 @@ impl<J: UnwindSafe> WorkerThread<J> {
     }
 
     fn run(self, f: impl Fn(J, ThreadPoolHandle<J>) + RefUnwindSafe) {
-        let abort = defer_abort();
-
-        while !self.core.stop.load(Ordering::Acquire) {
-            if let Some(job) = self.get_job() {
-                let core_ref = AssertUnwindSafe(&self.core);
-                match std::panic::catch_unwind(|| f(job, ThreadPoolHandle(core_ref))) {
-                    Ok(()) => (),
-                    Err(e) => log::error!("Job panicked: {:?}", e),
+        abort_on_panic(|| {
+            while !self.core.stop.load(Ordering::Acquire) {
+                if let Some(job) = self.get_job() {
+                    let core_ref = AssertUnwindSafe(&self.core);
+                    match std::panic::catch_unwind(|| f(job, ThreadPoolHandle(core_ref))) {
+                        Ok(()) => (),
+                        Err(e) => log::error!("Job panicked: {:?}", e),
+                    }
+                } else {
+                    self.core.park();
                 }
-            } else {
-                self.core.park();
             }
-        }
-
-        std::mem::forget(abort);
+        })
     }
 }
