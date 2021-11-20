@@ -1,7 +1,67 @@
-//! Threaded implementation of an executor
+//! A simple FIFO work queue threadpool for data-parallel concurrency.
+//!
+//! This module is designed to parallelize breadth-first queue processing
+//! operations, such as the following:
+//!
+//! ```
+//! # use std::collections::VecDeque;
+//! # #[derive(Debug, Clone, Copy)] struct FooData;
+//! # #[derive(Debug, Clone, Copy)] struct BarData;
+//! # const initial_data: FooData = FooData;
+//! # fn process_foo(_: FooData) -> BarData { BarData }
+//! #
+//! enum Job {
+//!     Foo(FooData),
+//!     Bar(BarData),
+//! }
+//!
+//! let mut q = VecDeque::new();
+//!
+//! q.push_back(Job::Foo(initial_data));
+//!
+//! while let Some(job) = q.pop_front() {
+//!     match job {
+//!         Job::Foo(foo) => {
+//!             let bar = process_foo(foo);
+//!             q.push_back(Job::Bar(bar));
+//!         },
+//!         Job::Bar(bar) => {
+//!             println!("Bar: {:?}", bar);
+//!         },
+//!     }
+//! }
+//! ```
+//!
+//! Using `topograph`, the above can be written to use a threadpool like so:
+//!
+//! ```
+//! # use topograph::{prelude::*, threaded};
+//! # #[derive(Debug, Clone, Copy)] struct FooData;
+//! # #[derive(Debug, Clone, Copy)] struct BarData;
+//! # const initial_data: FooData = FooData;
+//! # fn process_foo(_: FooData) -> BarData { BarData }
+//! #
+//! # enum Job {
+//! #     Foo(FooData),
+//! #     Bar(BarData),
+//! # }
+//! let pool = threaded::Builder::default().build(|job, handle| match job {
+//!     Job::Foo(foo) => {
+//!         let bar = process_foo(foo);
+//!         handle.push(Job::Bar(bar));
+//!     },
+//!     Job::Bar(bar) => {
+//!         println!("Bar: {:?}", bar);
+//!     },
+//! }).unwrap();
+//!
+//! pool.push(Job::Foo(initial_data));
+//! pool.join();
+//! ```
+
 
 use std::{
-    panic::{AssertUnwindSafe, RefUnwindSafe, UnwindSafe},
+    panic::{RefUnwindSafe, UnwindSafe},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -23,7 +83,7 @@ pub struct Builder {
 
 impl Builder {
     /// Specify the number of threads to use, or None to detect from `num_cpus`.
-    pub fn num_threads(&mut self, num: impl Into<Option<usize>>) -> &mut Self {
+    pub fn num_threads(mut self, num: impl Into<Option<usize>>) -> Self {
         self.num_threads = num.into();
         self
     }
@@ -35,7 +95,7 @@ impl<J: Send + UnwindSafe + 'static> ExecutorBuilder<J, Executor<J>> for Builder
 
     fn build(
         self,
-        f: impl Fn(J, &Handle<J>) + Send + Clone + RefUnwindSafe + 'static,
+        f: impl Fn(J, Handle<J>) + Send + Clone + RefUnwindSafe + 'static,
     ) -> Result<Executor<J>, Self::Error> {
         let Self { num_threads } = self;
 
@@ -105,7 +165,15 @@ struct Core<J> {
 /// This view allows you to push additional jobs, but does not expose any
 /// functionality that could interfere with a running thread pool.
 #[derive(Debug)]
-pub struct Handle<J>(AssertUnwindSafe<Arc<Core<J>>>);
+pub struct Handle<'a, J>(&'a Arc<Core<J>>);
+
+impl<'a, J> Copy for Handle<'a, J> {}
+impl<'a, J> Clone for Handle<'a, J> {
+    fn clone(&self) -> Self { *self }
+}
+
+impl<'a, J> UnwindSafe for Handle<'a, J> {}
+impl<'a, J> RefUnwindSafe for Handle<'a, J> {}
 
 /// Container and main executor for a FIFO thread pool.
 ///
@@ -159,7 +227,7 @@ impl<J> Core<J> {
     }
 }
 
-impl<J> ExecutorHandle<J> for Handle<J> {
+impl<'a, J> ExecutorHandle<'a, J> for Handle<'a, J> {
     fn push(&self, job: J) { self.0.push(job); }
 }
 
@@ -172,7 +240,7 @@ impl<J> Executor<J> {
 }
 
 impl<J: Send + UnwindSafe + 'static> crate::Executor<J> for Executor<J> {
-    type Handle = Handle<J>;
+    type Handle<'a> = Handle<'a, J>;
 
     #[inline]
     fn push(&self, job: J) { self.0.push(job); }
@@ -231,15 +299,12 @@ impl<J: UnwindSafe> WorkerThread<J> {
         })
     }
 
-    fn run(self, f: impl Fn(J, &Handle<J>) + RefUnwindSafe) {
+    fn run(self, f: impl Fn(J, Handle<J>) + RefUnwindSafe) {
         abort_on_panic(move || {
-            // TODO: while it would be nice to borrow self.core, this isn't
-            //       possible without GATs
-            let handle = Handle(AssertUnwindSafe(self.core.clone()));
-
             while !self.core.stop.load(Ordering::Acquire) {
+                let handle = Handle(&self.core);
                 if let Some(job) = self.get_job() {
-                    match std::panic::catch_unwind(|| f(job, &handle)) {
+                    match std::panic::catch_unwind(|| f(job, handle)) {
                         Ok(()) => (),
                         Err(e) => log::error!("Job panicked: {:?}", e),
                     }

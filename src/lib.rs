@@ -6,81 +6,32 @@
     rustdoc::broken_intra_doc_links
 )]
 #![warn(clippy::pedantic, clippy::cargo, missing_docs)]
+#![feature(generic_associated_types)]
 
-//! A simple threadpool for data-parallel concurrency.
+//! A tiny library for doing basic synchronous thread scheduling.
 //!
-//! This crate is designed to parallelize breadth-first queue processing
-//! operations, such as the following:
+//! This crate contains two main components, each with their own (slightly
+//! different) use cases:
+//!  - [`threaded`] is a simple FIFO thread pool for basic work queue operations
+//!  - [`graph`] is a topological sort implementation for handling more complex
+//!    cases with inter-task dependencies
 //!
-//! ```
-//! # use std::collections::VecDeque;
-//! # #[derive(Debug, Clone, Copy)] struct FooData;
-//! # #[derive(Debug, Clone, Copy)] struct BarData;
-//! # const initial_data: FooData = FooData;
-//! # fn process_foo(_: FooData) -> BarData { BarData }
-//! #
-//! enum Job {
-//!     Foo(FooData),
-//!     Bar(BarData),
-//! }
-//!
-//! let mut q = VecDeque::new();
-//!
-//! q.push_back(Job::Foo(initial_data));
-//!
-//! while let Some(job) = q.pop_front() {
-//!     match job {
-//!         Job::Foo(foo) => {
-//!             let bar = process_foo(foo);
-//!             q.push_back(Job::Bar(bar));
-//!         },
-//!         Job::Bar(bar) => {
-//!             println!("Bar: {:?}", bar);
-//!         },
-//!     }
-//! }
-//! ```
-//!
-//! Using `topograph`, the above can be written to use a threadpool like so:
-//!
-//! ```
-//! # use std::collections::VecDeque;
-//! # use topograph::{prelude::*, threaded};
-//! # #[derive(Debug, Clone, Copy)] struct FooData;
-//! # #[derive(Debug, Clone, Copy)] struct BarData;
-//! # const initial_data: FooData = FooData;
-//! # fn process_foo(_: FooData) -> BarData { BarData }
-//! #
-//! # enum Job {
-//! #     Foo(FooData),
-//! #     Bar(BarData),
-//! # }
-//! let pool = threaded::Builder::default().build(|job, handle| match job {
-//!     Job::Foo(foo) => {
-//!         let bar = process_foo(foo);
-//!         handle.push(Job::Bar(bar));
-//!     },
-//!     Job::Bar(bar) => {
-//!         // NOTE: this should be synchronized with a mutex
-//!         println!("Bar: {:?}", bar);
-//!     },
-//! }).unwrap();
-//!
-//! pool.push(Job::Foo(initial_data));
-//! pool.join();
-//! ```
+//! The documentation for each of the above modules contains example code for
+//! each use case.
 
-// pub mod graph;
+pub mod graph;
 pub mod threaded;
 
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
-// pub use graph::ExecutorBuilderExt;
+pub use graph::ExecutorBuilderExt;
 
 pub mod prelude {
     //! Common traits
 
-    pub use super::{Executor, ExecutorBuilder, /* ExecutorBuilderExt, */ ExecutorHandle};
+    pub use super::{
+        graph::SchedulerCore, Executor, ExecutorBuilder, ExecutorBuilderExt, ExecutorHandle,
+    };
 }
 
 /// Builder type for an executor
@@ -96,20 +47,20 @@ pub trait ExecutorBuilder<J: UnwindSafe, E: Executor<J>> {
     /// the executor.
     fn build(
         self,
-        work: impl Fn(J, &E::Handle) + Send + Clone + RefUnwindSafe + 'static,
+        work: impl Fn(J, E::Handle<'_>) + Send + Clone + RefUnwindSafe + 'static,
     ) -> Result<E, Self::Error>;
 }
 
 /// Abstraction over a handle into an [`Executor`] accessible to concurrent jobs
-pub trait ExecutorHandle<J>: UnwindSafe + RefUnwindSafe {
+pub trait ExecutorHandle<'a, J>: Copy + UnwindSafe + RefUnwindSafe + 'a {
     /// Push a new job onto the executor for running as soon as possible
     fn push(&self, job: J);
 }
 
-/// Abstraction over a thread pool that
+/// Abstraction over a thread pool that executes jobs in a dependency-free queue
 pub trait Executor<J: UnwindSafe>: Sized {
     /// The handle into this executor exposed to running jobs
-    type Handle: ExecutorHandle<J>;
+    type Handle<'a>: ExecutorHandle<'a, J>;
 
     /// Push a new job onto the executor for running as soon as possible
     fn push(&self, job: J);
@@ -119,6 +70,6 @@ pub trait Executor<J: UnwindSafe>: Sized {
     fn join(self);
 
     /// Disable pushing new jobs and wait for all currently-running jobs to
-    /// finish before dropping the rest.
+    /// finish before dropping the rest
     fn abort(self);
 }
