@@ -59,7 +59,6 @@
 //! pool.join();
 //! ```
 
-
 use std::{
     panic::{RefUnwindSafe, UnwindSafe},
     sync::{
@@ -78,10 +77,17 @@ use crate::prelude::*;
 /// Builder for a threaded executor
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Builder {
+    lifo: bool,
     num_threads: Option<usize>,
 }
 
 impl Builder {
+    /// Specify whether this executor should use a LIFO queue (default is FIFO).
+    pub fn lifo(mut self, lifo: bool) -> Self {
+        self.lifo = lifo;
+        self
+    }
+
     /// Specify the number of threads to use, or None to detect from `num_cpus`.
     pub fn num_threads(mut self, num: impl Into<Option<usize>>) -> Self {
         self.num_threads = num.into();
@@ -97,12 +103,21 @@ impl<J: Send + UnwindSafe + 'static> ExecutorBuilder<J, Executor<J>> for Builder
         self,
         f: impl Fn(J, Handle<J>) + Send + Clone + RefUnwindSafe + 'static,
     ) -> Result<Executor<J>, Self::Error> {
-        let Self { num_threads } = self;
+        let Self { lifo, num_threads } = self;
 
         let num_threads = num_threads.unwrap_or_else(num_cpus::get);
 
         let work = (0..num_threads)
-            .map(|i| (i, Worker::new_fifo()))
+            .map(|i| {
+                (
+                    i,
+                    if lifo {
+                        Worker::new_lifo()
+                    } else {
+                        Worker::new_fifo()
+                    },
+                )
+            })
             .collect::<Vec<_>>();
 
         let steal = work
