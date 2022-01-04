@@ -83,12 +83,14 @@ pub struct Builder {
 
 impl Builder {
     /// Specify whether this executor should use a LIFO queue (default is FIFO).
+    #[must_use]
     pub fn lifo(mut self, lifo: bool) -> Self {
         self.lifo = lifo;
         self
     }
 
     /// Specify the number of threads to use, or None to detect from `num_cpus`.
+    #[must_use]
     pub fn num_threads(mut self, num: impl Into<Option<usize>>) -> Self {
         self.num_threads = num.into();
         self
@@ -242,7 +244,8 @@ impl<J> Core<J> {
     }
 }
 
-impl<'a, J> ExecutorHandle<'a, J> for Handle<'a, J> {
+impl<'a, J> ExecutorHandle<J> for Handle<'a, J> {
+    #[inline]
     fn push(&self, job: J) { self.0.push(job); }
 }
 
@@ -254,11 +257,13 @@ impl<J> Executor<J> {
     }
 }
 
-impl<J: Send + UnwindSafe + 'static> crate::Executor<J> for Executor<J> {
-    type Handle<'a> = Handle<'a, J>;
-
+impl<J> ExecutorHandle<J> for Executor<J> {
     #[inline]
     fn push(&self, job: J) { self.0.push(job); }
+}
+
+impl<J: Send + UnwindSafe + 'static> crate::Executor<J> for Executor<J> {
+    type Handle<'a> = Handle<'a, J>;
 
     fn join(mut self) {
         self.0.join();

@@ -58,24 +58,28 @@ use std::{
     marker::PhantomData,
     mem,
     mem::{ManuallyDrop, MaybeUninit},
+    ops,
     panic::{AssertUnwindSafe, RefUnwindSafe, UnwindSafe},
     ptr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicPtr, AtomicUsize, Ordering},
         Arc,
     },
 };
 
+use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
+use thiserror::Error;
+
 use crate::prelude::*;
 
 /// The core interface for scheduling tasks with dependencies
-pub trait SchedulerCore<'a, J> {
+pub trait SchedulerCore<'a, J>: ExecutorHandle<J> {
     /// Create a pending job
     ///
     /// # Panics
     /// This function panics if `dependencies` is an invalid value of `0` or
     /// `usize::MAX`
-    fn create_node(&self, payload: J, dependencies: usize) -> DependencyBag<J> {
+    fn create_node(&self, payload: J, dependencies: usize) -> NodeBuilder<J> {
         self.create_node_or_run(payload, dependencies).unwrap()
     }
 
@@ -84,22 +88,61 @@ pub trait SchedulerCore<'a, J> {
     /// # Panics
     /// This function panics if `dependencies` is equal to `usize::MAX`, which
     /// is a reserved number
-    fn create_node_or_run(&self, payload: J, dependencies: usize) -> Option<DependencyBag<J>>;
+    fn create_node_or_run(&self, payload: J, dependencies: usize) -> Option<NodeBuilder<J>>;
 
-    /// Add a job to the graph, as well as the jobs that should run after it
-    fn push_dependency(&self, payload: J, dependents: impl IntoIterator<Item = Arc<Node<J>>>);
+    /// Add a job to the graph, as well as an optional reference to the edges
+    /// that should run after it.
+    ///
+    /// Other references to the value passed for dependents may be later used
+    /// for lazily scheduling dependent jobs.  If no reference is passed, this
+    /// function must behave identically to [`ExecutorHandle::push`]
+    fn push_with_dependents(&self, payload: J, dependents: OptRcDependents<J>);
+
+    /// Add a job to the graph, as well as the jobs that should run after it.
+    ///
+    /// Returns a handle to allow lazily scheduling dependent jobs.
+    fn push_dependency(
+        &self,
+        payload: J,
+        dependents: impl IntoIterator<Item = Edge<J>>,
+    ) -> Arc<Dependents<J>> {
+        let deps = Dependents::new(dependents.into_iter().collect());
+
+        self.push_with_dependents(payload, Some(deps.clone()));
+
+        deps
+    }
 }
 
-/// A reference to a job that may be pending
+// manually drop, and unsafe cell, and maybe uninit, oh my!
+type NodePayload<T> = ManuallyDrop<UnsafeCell<MaybeUninit<T>>>;
+
 #[derive(Debug)]
-pub struct Node<J> {
-    payload: ManuallyDrop<UnsafeCell<MaybeUninit<J>>>,
+struct Node<J> {
+    payload: NodePayload<J>,
+    dependents: AtomicPtr<Dependents<J>>,
     dependencies: AtomicUsize,
 }
 
-// Rationale: J can only be accessed by the last dependency as it polls this
-// node, or by the Drop impl.
-unsafe impl<J> Sync for Node<J> {}
+/// A handle to a pending job.  When "decremented," the number of unsatisfied
+/// dependencies this edge points to is reduced by one, and the job is run once
+/// all dependencies are marked as satisfied.
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct Edge<J> {
+    to: Arc<Node<J>>,
+}
+
+/// An error for operations performed on a [`NodeBuilder`] after the last
+/// reference to the node has been assigned to an inbound edge.
+///
+/// The reason for this error is that a node cannot be accessed once all inbound
+/// (dependency) edges are exposed as at this point it becomes possible for the
+/// node to be marked as ready to execute and for it to be destructured into a
+/// queue job.
+#[derive(Debug, Clone, Copy, Error)]
+#[error("The node associated with this builder can no longer be accessed")]
+pub struct NodeDispatched;
 
 /// Helper struct for parceling out node dependencies
 ///
@@ -107,18 +150,55 @@ unsafe impl<J> Sync for Node<J> {}
 /// This struct panics on drop if not all dependencies are used, as this results
 /// in a node that cannot run.
 #[derive(Debug)]
-pub struct DependencyBag<J> {
+pub struct NodeBuilder<J> {
     node: Option<Arc<Node<J>>>,
     remaining: usize,
 }
 
-type Dependents<J> = Box<[Arc<Node<J>>]>;
+/// A reference to the jobs dependent on a queued job.
+#[derive(Debug)]
+pub struct Dependents<J>(RwLock<Option<Vec<Edge<J>>>>);
+
+#[derive(Debug)]
+enum AdoptState<J> {
+    Orphan(Vec<Edge<J>>),
+    Adopted(Arc<Dependents<J>>),
+    Abandoned,
+    Completed,
+    Poisoned,
+}
+
+/// An error for operations performed on an [`AdoptableDependents`] list in an
+/// invalid state.
+#[derive(Debug, Clone, Copy, Error)]
+#[error("Adoptable dependents have already been adopted or abandoned")]
+pub struct BadAdoptState;
+
+/// Helper type for tracking dependents of a job completely in parallel to its
+/// discovery and enqueuing process.
+///
+/// This struct can handle tracking dependencies for:
+///  - Jobs that do not exist in memory yet
+///  - Jobs that have been discovered and that may or may not have completed
+///  - Jobs that are known never to be created
+///     - ...and which can be considered as already completed
+///     - ...and which should be treated as never finishing
+#[derive(Debug)]
+pub struct AdoptableDependents<J>(AdoptState<J>);
+
+/// A wrapper type for [`AdoptableDependents`] providing `Clone`, `Send`, and
+/// `Sync` impls
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct RcAdoptableDependents<J>(AssertUnwindSafe<Arc<Mutex<AdoptableDependents<J>>>>);
+
+type OptRcDependents<J> = Option<Arc<Dependents<J>>>;
 
 /// A job payload and associated dependency information
 #[derive(Debug)]
 pub struct Job<J> {
     payload: J,
-    dependents: AssertUnwindSafe<Option<Dependents<J>>>,
+    dependents: AssertUnwindSafe<OptRcDependents<J>>,
 }
 
 /// A handle into the graph scheduler for running jobs
@@ -129,12 +209,61 @@ pub struct Handle<H>(H);
 #[derive(Debug)]
 pub struct Scheduler<J, E> {
     executor: E,
-    _m: PhantomData<J>,
+    _m: PhantomData<AssertUnwindSafe<J>>,
+}
+
+// Rationale: J can only be accessed by the last dependency as it polls this
+// node, or by the Drop impl.
+unsafe impl<J> Sync for Node<J> {}
+
+impl<J> Node<J> {
+    fn decrement<'a, H: SchedulerCore<'a, J>>(&self, handle: &H) {
+        match self.dependencies.fetch_sub(1, Ordering::SeqCst) {
+            1 => {
+                let job = {
+                    let mut taken = MaybeUninit::zeroed();
+
+                    unsafe {
+                        ptr::swap(self.payload.get(), &mut taken);
+                        taken.assume_init()
+                    }
+                };
+
+                let dependents = {
+                    let ptr = self.dependents.swap(ptr::null_mut(), Ordering::SeqCst);
+
+                    if ptr.is_null() {
+                        None
+                    } else {
+                        Some(unsafe { Arc::from_raw(ptr) })
+                    }
+                };
+
+                handle.push_with_dependents(job, dependents);
+            },
+            0 | usize::MAX => unreachable!(),
+            _ => (),
+        }
+    }
+
+    fn set_dependents(&self, dependents: Arc<Dependents<J>>) -> Result<(), Arc<Dependents<J>>> {
+        let ptr = Arc::into_raw(dependents);
+
+        self.dependents
+            .compare_exchange(
+                ptr::null_mut(),
+                ptr as *mut Dependents<J>,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            )
+            .map(|_| ())
+            .map_err(|_| unsafe { Arc::from_raw(ptr) })
+    }
 }
 
 impl<J> Drop for Node<J> {
     fn drop(&mut self) {
-        match self.dependencies.swap(0, Ordering::SeqCst) {
+        match mem::replace(self.dependencies.get_mut(), 0) {
             0 => (),
             usize::MAX => unreachable!(),
             _ => unsafe {
@@ -148,7 +277,11 @@ impl<J> Drop for Node<J> {
     }
 }
 
-impl<J> DependencyBag<J> {
+impl<J> Edge<J> {
+    fn new(to: Arc<Node<J>>) -> Self { Self { to } }
+}
+
+impl<J> NodeBuilder<J> {
     fn create_or_run(payload: J, dependencies: usize, run: impl FnOnce(J)) -> Option<Self> {
         match dependencies {
             0 => {
@@ -160,10 +293,11 @@ impl<J> DependencyBag<J> {
             _ => {
                 let node = Arc::new(Node {
                     payload: ManuallyDrop::new(UnsafeCell::new(MaybeUninit::new(payload))),
+                    dependents: AtomicPtr::new(ptr::null_mut()),
                     dependencies: AtomicUsize::new(dependencies),
                 });
 
-                Some(DependencyBag {
+                Some(NodeBuilder {
                     node: Some(node),
                     remaining: dependencies,
                 })
@@ -171,16 +305,20 @@ impl<J> DependencyBag<J> {
         }
     }
 
-    /// Request a single dependency.
+    /// Request a single inbound edge (dependency).
     ///
     /// # Panics
     /// This method panics if no more dependency handles are available.
     #[inline]
-    pub fn take(&mut self) -> Arc<Node<J>> { self.try_take().unwrap() }
+    pub fn get_in_edge(&mut self) -> Edge<J> { self.try_get_in_edge().unwrap() }
 
-    /// Request a single dependency, returning `None` if no more are available.
-    #[inline]
-    pub fn try_take(&mut self) -> Option<Arc<Node<J>>> {
+    /// Request a single inbound edge (dependency), returning `None` if no more
+    /// are available.
+    pub fn try_get_in_edge(&mut self) -> Option<Edge<J>> {
+        if self.remaining > 0 && self.node.is_none() {
+            unreachable!();
+        }
+
         let node = match self.remaining {
             0 => None,
             1 => {
@@ -193,14 +331,36 @@ impl<J> DependencyBag<J> {
             },
         };
 
-        if node.is_none() {
-            unreachable!();
+        node.map(Edge::new)
+    }
+
+    /// Add a list of dependents to this node.
+    ///
+    /// # Errors
+    /// This function returns an error if the node is no longer available to be
+    /// accessed safely or if a dependent list has already been assigned to the
+    /// node.
+    pub fn set_dependents(
+        &mut self, // NOTE: this mut is IMPORTANT!
+        dependents: Arc<Dependents<J>>,
+    ) -> Result<(), Arc<Dependents<J>>> {
+        let node = match self.node.as_ref() {
+            Some(n) => n,
+            None => return Err(dependents),
+        };
+
+        debug_assert!(self.remaining > 0);
+        debug_assert!(node.dependencies.load(Ordering::SeqCst) >= self.remaining);
+
+        if let Err(dependents) = node.set_dependents(dependents) {
+            return Err(dependents);
         }
-        node
+
+        Ok(())
     }
 }
 
-impl<J> Drop for DependencyBag<J> {
+impl<J> Drop for NodeBuilder<J> {
     fn drop(&mut self) {
         assert!(
             self.remaining == 0 || self.node.is_none(),
@@ -209,7 +369,229 @@ impl<J> Drop for DependencyBag<J> {
     }
 }
 
+impl<J> Dependents<J> {
+    /// Construct a new dependent list from its inner vector
+    #[must_use]
+    pub fn new(dependents: Vec<Edge<J>>) -> Arc<Self> {
+        Arc::new(Self(RwLock::new(Some(dependents))))
+    }
+
+    /// Push a new dependent job into this dependents list.
+    ///
+    /// If the job associated with this list has already run, the job will be
+    /// enqueued immediately.
+    pub fn push<'a, H: SchedulerCore<'a, J>>(&self, handle: &H, dependent: Edge<J>) {
+        let this = self.0.upgradable_read();
+
+        if this.is_some() {
+            let mut this = RwLockUpgradableReadGuard::upgrade(this);
+            let this = this.as_mut().unwrap_or_else(|| unreachable!());
+
+            this.push(dependent);
+        } else {
+            dependent.to.decrement(handle);
+        }
+    }
+}
+
+impl<J> From<Edge<J>> for Arc<Dependents<J>> {
+    #[inline]
+    fn from(edge: Edge<J>) -> Self { Dependents::new(vec![edge]) }
+}
+
+impl<J> std::iter::FromIterator<Edge<J>> for Arc<Dependents<J>> {
+    #[inline]
+    fn from_iter<I: IntoIterator<Item = Edge<J>>>(it: I) -> Self {
+        Dependents::new(it.into_iter().collect())
+    }
+}
+
+impl<J> UnwindSafe for AdoptableDependents<J> {}
+impl<J> RefUnwindSafe for AdoptableDependents<J> {}
+
+impl<J> AdoptableDependents<J> {
+    /// Construct a new `AdoptableDependents` in its initial "orphan" state.
+    ///
+    /// Calls to [`push`](Self::push) will hold pending jobs in a list to be
+    /// processed with one of the state transition functions, such as
+    /// [`adopt`](Self::adopt) or [`abandon`](Self::abandon).
+    #[must_use]
+    pub fn new() -> Self { Self(AdoptState::Orphan(vec![])) }
+
+    /// Construct a new `AdoptableDependents` in an already-adopted state.
+    ///
+    /// Calls to [`push`](Self::push) will function identically to calling
+    /// [`push`](Dependents::push) directly on the value provided for
+    /// `dependents`.
+    #[must_use]
+    pub fn adopted(dependents: Arc<Dependents<J>>) -> Self { Self(AdoptState::Adopted(dependents)) }
+
+    /// Construct a new `AdoptableDependencies` in an "abandoned" state.
+    ///
+    /// Calls to [`push`](Self::push) will function as if called on a job that
+    /// failed, blocking any dependent jobs from running.
+    #[must_use]
+    pub fn abandoned() -> Self { Self(AdoptState::Abandoned) }
+
+    /// Construct a new `AdoptableDependents` in a "completed" state.
+    ///
+    /// Calls to [`push`](Self::push) will function as if called on a job that
+    /// has already completed, immediately decrementing the unsatisfied
+    /// dependencies for the node.
+    #[must_use]
+    pub fn completed() -> Self { Self(AdoptState::Completed) }
+
+    /// Wrap this `AdoptableDependents` in an `Arc<Mutex>` allowing for cloning
+    /// and sending between threads.
+    #[inline]
+    #[must_use]
+    pub fn rc(self) -> RcAdoptableDependents<J> {
+        RcAdoptableDependents(AssertUnwindSafe(Arc::new(Mutex::new(self))))
+    }
+
+    /// Add an edge to the list of dependents.
+    ///
+    /// The exact behavior varies depending on the underlying state of the
+    /// `AdoptableDependents` instance:
+    ///  - Orphaned instances will store the edge in a list of pending edges
+    ///  - Adopted instances will pass the edge along to the adopted dependency
+    ///    list, which will either queue it or decrement it immediately
+    ///  - Completed instances will immediately decrement edges as if adopted by
+    ///    a finished job
+    ///  - Abandoned instances will do nothing, as if adopted by a failed job
+    ///
+    /// # Panics
+    /// This function panics if the instance is found to be in a poisoned state.
+    pub fn push<'a, H: SchedulerCore<'a, J>>(&mut self, handle: &H, dependent: Edge<J>) {
+        match self.0 {
+            AdoptState::Orphan(ref mut deps) => {
+                deps.push(dependent);
+            },
+            AdoptState::Adopted(ref dependents) => dependents.push(handle, dependent),
+            AdoptState::Abandoned => mem::drop(dependent),
+            AdoptState::Completed => dependent.to.decrement(handle),
+            AdoptState::Poisoned => panic!("AdoptableDependents was poisoned"),
+        }
+    }
+
+    /// Attach an orphaned instance to a dependent list for an existing job.
+    ///
+    /// Any jobs stored internally will be forwarded to the adopted dependent
+    /// list, as will any further calls to [`push`](Self::push).
+    ///
+    /// # Errors
+    /// This function returns an error if this `AdoptableDependents` is in a
+    /// state other than orphaned.
+    ///
+    /// # Panics
+    /// This function panics if the instance is found to be in a poisoned state.
+    pub fn adopt<'a, H: SchedulerCore<'a, J>>(
+        &mut self,
+        handle: &H,
+        dependents: Arc<Dependents<J>>,
+    ) -> Result<(), BadAdoptState> {
+        match self.0 {
+            AdoptState::Orphan(_) => (),
+            AdoptState::Adopted(_) | AdoptState::Abandoned | AdoptState::Completed => {
+                return Err(BadAdoptState);
+            },
+            AdoptState::Poisoned => panic!("AdoptableDependents was poisoned"),
+        }
+
+        if let AdoptState::Orphan(deps) = mem::replace(&mut self.0, AdoptState::Poisoned) {
+            for dep in deps {
+                dependents.push(handle, dep);
+            }
+
+            self.0 = AdoptState::Adopted(dependents);
+
+            Ok(())
+        } else {
+            unreachable!()
+        }
+    }
+
+    /// Abandon a non-adopted instance.
+    ///
+    /// Any stored jobs will be dropped and all future calls to
+    /// [`push`](Self::push) will do nothing.  The value returned is true if
+    /// this instance was not already abandoned.
+    ///
+    /// # Errors
+    /// This function returns an error if this `AdoptableDependents` is not in
+    /// the initial orphaned state or already abandoned.
+    ///
+    /// # Panics
+    /// This function panics if the instance is found to be in a poisoned state.
+    pub fn abandon(&mut self) -> Result<bool, BadAdoptState> {
+        match self.0 {
+            AdoptState::Orphan(_) => (),
+            AdoptState::Adopted(_) | AdoptState::Completed => return Err(BadAdoptState),
+            AdoptState::Abandoned => return Ok(false),
+            AdoptState::Poisoned => panic!("AdoptableDependencies was poisoned"),
+        }
+
+        if let AdoptState::Orphan(jobs) = mem::replace(&mut self.0, AdoptState::Abandoned) {
+            mem::drop(jobs);
+
+            Ok(true)
+        } else {
+            unreachable!();
+        }
+    }
+
+    /// Mark a non-adopted instance as completed.
+    ///
+    /// Any stored jobs will be decremented and all future calls to
+    /// [`push`](Self::push) will behave as if passed to a completed job.
+    /// The value returned is true if this instance was adopted or not
+    /// already completed.
+    ///
+    /// # Errors
+    /// This function returns an error if this `AdoptableDependents` is not in
+    /// the initial orphaned state, already adopted, or already completed.
+    ///
+    /// # Panics
+    /// This function panics if the instance is found to be in a poisoned state.
+    pub fn complete<'a, H: SchedulerCore<'a, J>>(
+        &mut self,
+        handle: &H,
+    ) -> Result<bool, BadAdoptState> {
+        match self.0 {
+            AdoptState::Orphan(_) => (),
+            AdoptState::Adopted(_) | AdoptState::Completed => return Ok(false),
+            AdoptState::Abandoned => return Err(BadAdoptState),
+            AdoptState::Poisoned => panic!("AdoptableDependents was poisoned"),
+        }
+
+        if let AdoptState::Orphan(edges) = mem::replace(&mut self.0, AdoptState::Completed) {
+            for edge in edges {
+                edge.to.decrement(handle);
+            }
+
+            Ok(true)
+        } else {
+            unreachable!();
+        }
+    }
+}
+
+impl<J> Default for AdoptableDependents<J> {
+    fn default() -> Self { Self::new() }
+}
+
+impl<J> ops::Deref for RcAdoptableDependents<J> {
+    type Target = Mutex<AdoptableDependents<J>>;
+
+    fn deref(&self) -> &Self::Target { self.0.as_ref() }
+}
+
+impl<J> Clone for RcAdoptableDependents<J> {
+    fn clone(&self) -> Self { Self(AssertUnwindSafe(self.0.clone())) }
+}
+
 impl<J> From<J> for Job<J> {
+    #[inline]
     fn from(payload: J) -> Self {
         Self {
             payload,
@@ -218,25 +600,22 @@ impl<J> From<J> for Job<J> {
     }
 }
 
-impl<'a, J, H: ExecutorHandle<'a, Job<J>>> SchedulerCore<'a, J> for Handle<H> {
-    fn create_node_or_run(&self, payload: J, dependencies: usize) -> Option<DependencyBag<J>> {
-        DependencyBag::create_or_run(payload, dependencies, |j| self.0.push(j.into()))
+impl<'a, J, H: ExecutorHandle<Job<J>>> SchedulerCore<'a, J> for Handle<H> {
+    fn create_node_or_run(&self, payload: J, dependencies: usize) -> Option<NodeBuilder<J>> {
+        NodeBuilder::create_or_run(payload, dependencies, |j| self.0.push(j.into()))
     }
 
-    fn push_dependency(&self, payload: J, dependents: impl IntoIterator<Item = Arc<Node<J>>>) {
+    #[inline]
+    fn push_with_dependents(&self, payload: J, dependents: OptRcDependents<J>) {
         self.0.push(Job {
             payload,
-            dependents: AssertUnwindSafe(Some(
-                dependents
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            )),
+            dependents: AssertUnwindSafe(dependents),
         });
     }
 }
 
-impl<'a, J, H: ExecutorHandle<'a, Job<J>>> ExecutorHandle<'a, J> for Handle<H> {
+impl<'a, J, H: ExecutorHandle<Job<J>>> ExecutorHandle<J> for Handle<H> {
+    #[inline]
     fn push(&self, job: J) { self.0.push(job.into()); }
 }
 
@@ -253,31 +632,19 @@ where for<'a> E::Handle<'a>: Clone
                       payload,
                       dependents,
                   },
-                  handle| match f(payload, Handle(handle)) {
-                Ok(()) => {
-                    if let Some(dependents) = dependents.0 {
-                        for dep in Vec::from(dependents) {
-                            match dep.dependencies.fetch_sub(1, Ordering::SeqCst) {
-                                1 => {
-                                    let job = {
-                                        let mut taken = MaybeUninit::zeroed();
+                  handle| {
+                let handle = Handle(handle);
 
-                                        unsafe {
-                                            ptr::swap(dep.payload.get(), &mut taken);
-                                            taken.assume_init()
-                                        }
-                                    };
-
-                                    // TODO: this means we don't handle transitive dependencies
-                                    handle.push(job.into());
-                                },
-                                0 | usize::MAX => unreachable!(),
-                                _ => (),
+                match f(payload, handle) {
+                    Ok(()) => {
+                        if let Some(dependents) = dependents.0 {
+                            for dep in mem::take(&mut *dependents.0.write()).into_iter().flatten() {
+                                dep.to.decrement(&handle);
                             }
                         }
-                    }
-                },
-                Err(()) => (),
+                    },
+                    Err(()) => (),
+                }
             },
         )?;
 
@@ -322,11 +689,13 @@ impl<J: UnwindSafe, E: Executor<Job<J>>, B: ExecutorBuilder<Job<J>, E> + Sized>
     }
 }
 
-impl<J: UnwindSafe, E: Executor<Job<J>>> Executor<J> for Scheduler<J, E> {
-    type Handle<'a> = Handle<E::Handle<'a>>;
-
+impl<J: UnwindSafe, E: Executor<Job<J>>> ExecutorHandle<J> for Scheduler<J, E> {
     #[inline]
     fn push(&self, job: J) { self.executor.push(job.into()); }
+}
+
+impl<J: UnwindSafe, E: Executor<Job<J>>> Executor<J> for Scheduler<J, E> {
+    type Handle<'a> = Handle<E::Handle<'a>>;
 
     #[inline]
     fn join(self) { self.executor.join(); }
@@ -336,19 +705,15 @@ impl<J: UnwindSafe, E: Executor<Job<J>>> Executor<J> for Scheduler<J, E> {
 }
 
 impl<'a, J: UnwindSafe, E: Executor<Job<J>>> SchedulerCore<'a, J> for Scheduler<J, E> {
-    fn create_node_or_run(&self, payload: J, dependencies: usize) -> Option<DependencyBag<J>> {
-        DependencyBag::create_or_run(payload, dependencies, |j| self.executor.push(j.into()))
+    fn create_node_or_run(&self, payload: J, dependencies: usize) -> Option<NodeBuilder<J>> {
+        NodeBuilder::create_or_run(payload, dependencies, |j| self.executor.push(j.into()))
     }
 
-    fn push_dependency(&self, payload: J, dependents: impl IntoIterator<Item = Arc<Node<J>>>) {
+    #[inline]
+    fn push_with_dependents(&self, payload: J, dependents: OptRcDependents<J>) {
         self.executor.push(Job {
             payload,
-            dependents: AssertUnwindSafe(Some(
-                dependents
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            )),
+            dependents: AssertUnwindSafe(dependents),
         });
     }
 }

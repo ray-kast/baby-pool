@@ -51,19 +51,17 @@ pub trait ExecutorBuilder<J: UnwindSafe, E: Executor<J>> {
     ) -> Result<E, Self::Error>;
 }
 
-/// Abstraction over a handle into an [`Executor`] accessible to concurrent jobs
-pub trait ExecutorHandle<'a, J>: Copy + UnwindSafe + RefUnwindSafe + 'a {
+/// The smallest possible abstraction over an [`Executor`] and its associated
+/// [`Handle`](Executor::Handle)
+pub trait ExecutorHandle<J> {
     /// Push a new job onto the executor for running as soon as possible
     fn push(&self, job: J);
 }
 
 /// Abstraction over a thread pool that executes jobs in a dependency-free queue
-pub trait Executor<J: UnwindSafe>: Sized {
+pub trait Executor<J: UnwindSafe>: ExecutorHandle<J> + Sized {
     /// The handle into this executor exposed to running jobs
-    type Handle<'a>: ExecutorHandle<'a, J>;
-
-    /// Push a new job onto the executor for running as soon as possible
-    fn push(&self, job: J);
+    type Handle<'a>: ExecutorHandle<J> + Copy + UnwindSafe + RefUnwindSafe + 'a;
 
     /// Disable pushing new jobs and wait for all pending work to complete,
     /// including jobs queued by currently-running jobs
