@@ -250,6 +250,10 @@ impl<'a, J> ExecutorHandle<J> for Handle<'a, J> {
 }
 
 impl<J> Executor<J> {
+    /// Get the number of threads created for this executor
+    #[must_use]
+    pub fn num_threads(&self) -> usize { self.1.len() }
+
     fn join_threads(&mut self) {
         for handle in self.1.drain(..) {
             handle.join().unwrap();

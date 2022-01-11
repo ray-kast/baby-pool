@@ -655,6 +655,16 @@ where for<'a> E::Handle<'a>: Clone
     }
 }
 
+impl<J, E> std::ops::Deref for Scheduler<J, E> {
+    type Target = E;
+
+    fn deref(&self) -> &E { &self.executor }
+}
+
+impl<J, E> std::ops::DerefMut for Scheduler<J, E> {
+    fn deref_mut(&mut self) -> &mut E { &mut self.executor }
+}
+
 /// Adds the [`build_graph`](ExecutorBuilderExt::build_graph) method to
 /// [`ExecutorBuilder`]
 pub trait ExecutorBuilderExt<J: UnwindSafe, E: Executor<Job<J>>>:

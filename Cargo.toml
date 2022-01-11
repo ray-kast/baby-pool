@@ -1,6 +1,6 @@
 [package]
 name = "topograph"
-version = "0.3.0-alpha.1"
+version = "0.3.1-alpha.1"
 authors = ["raykast <rookie1286@gmail.com>"]
 edition = "2021"
 description = "A miniscule thread pool and toposort scheduler"
