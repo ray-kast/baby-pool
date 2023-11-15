@@ -1,4 +1,4 @@
-# `topograph` - A tiny thread pool and toposort implmentation
+# `topograph` - A tiny thread pool and toposort implementation
 No diving allowed!
 
 **WARNING:** The `0.2.x-alpha*` versions use the `generic_associated_types`
