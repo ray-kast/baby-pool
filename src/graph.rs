@@ -619,7 +619,7 @@ impl<J: UnwindSafe, E: ExecutorCore<Job<J>>> Scheduler<J, E>
 where for<'a> E::Handle<'a>: Clone
 {
     /// Construct a new graph scheduler
-    fn new<B: ExecutorBuilder<Job<J>, E>>(
+    fn new<B: ExecutorBuilder<Job<J>, E, ()>>(
         b: B,
         f: impl Fn(J, Handle<E::Handle<'_>>) -> Result<(), ()> + Send + Clone + RefUnwindSafe + 'static,
     ) -> Result<Self, B::Error> {
@@ -665,7 +665,7 @@ impl<J, E> std::ops::DerefMut for Scheduler<J, E> {
 /// Adds the [`build_graph`](ExecutorBuilderExt::build_graph) method to
 /// [`ExecutorBuilder`]
 pub trait ExecutorBuilderExt<J: UnwindSafe, E: ExecutorCore<Job<J>>>:
-    Sized + ExecutorBuilder<Job<J>, E>
+    Sized + ExecutorBuilder<Job<J>, E, ()>
 {
     /// Construct a new graph scheduler using this builder's executor type
     ///
@@ -681,7 +681,7 @@ pub trait ExecutorBuilderExt<J: UnwindSafe, E: ExecutorCore<Job<J>>>:
     ) -> Result<Scheduler<J, E>, Self::Error>;
 }
 
-impl<J: UnwindSafe, E: ExecutorCore<Job<J>>, B: ExecutorBuilder<Job<J>, E> + Sized>
+impl<J: UnwindSafe, E: ExecutorCore<Job<J>>, B: ExecutorBuilder<Job<J>, E, ()> + Sized>
     ExecutorBuilderExt<J, E> for B
 {
     fn build_graph(

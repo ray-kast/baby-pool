@@ -24,7 +24,6 @@
 
 pub mod graph;
 pub mod nonblock;
-pub mod blocking;
 mod executor;
 
 use std::{

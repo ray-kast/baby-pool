@@ -13,12 +13,11 @@ use crossbeam::deque::{Injector, Steal, Stealer, Worker};
 use dispose::abort_on_panic;
 use futures_util::FutureExt;
 
-use crate::prelude::*;
-use crate::nonblock::unwind::AbortOnPanic;
+use crate::{nonblock::unwind::AbortOnPanic, prelude::*};
 
 // TODO: check all trait bounds to see what can be relaxed
 
-trait Runtime {
+pub trait Runtime {
     // TODO: dumb issue with bounds and Debug requirements
     type Mutex<T: Debug + Send>: Debug + Send + Sync;
     type Condvar: Debug + Send + Sync;
@@ -35,7 +34,7 @@ trait Runtime {
     fn notify_all(cvar: &Self::Condvar) -> usize;
 }
 
-trait Spawn<F, J>: Runtime {
+pub trait Spawn<F, J>: Runtime {
     type Output;
     type Error: std::error::Error;
 
@@ -46,7 +45,7 @@ trait Spawn<F, J>: Runtime {
     ) -> Result<Self::JoinHandle<Self::Output>, Self::Error>;
 }
 
-trait RuntimeSync: Runtime {
+pub trait RuntimeSync: Runtime {
     type MutexGuard<'a, T: 'a>: ops::Deref<Target = T> + ops::DerefMut;
 
     fn lock<T: Debug + Send>(mutex: &Self::Mutex<T>) -> Self::MutexGuard<'_, T>;
@@ -56,7 +55,7 @@ trait RuntimeSync: Runtime {
     fn join<T>(handle: Self::JoinHandle<T>) -> Result<T, Self::JoinError>;
 }
 
-trait RuntimeAsync: Runtime {
+pub trait RuntimeAsync: Runtime {
     type MutexGuard<'a, T>: ops::Deref<Target = T> + ops::DerefMut + Send;
 
     fn lock<T: Debug + Send>(
@@ -215,10 +214,10 @@ impl Builder {
 // TODO: remove usages of impl Trait where it muddies the API
 
 impl Builder {
-    // // TODO: when `!`
-    // type Error = std::convert::Infallible;
-
-    fn build<J, R: Spawn<F, J, Output = ()> + ?Sized, F: Clone>(self, f: F) -> Executor<J, R> {
+    pub fn build<J, R: Spawn<F, J, Output = ()> + ?Sized, F: Clone>(
+        self,
+        f: F,
+    ) -> Result<Executor<J, R>, R::Error> {
         let Self { lifo, num_threads } = self;
 
         let num_threads = num_threads.unwrap_or_else(num_cpus::get);
@@ -268,13 +267,12 @@ impl Builder {
                             },
                             f.clone(),
                         )
-                        .unwrap()
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Result<Vec<_>, _>>()
             }
-        });
+        })?;
 
-        Executor(core, handles)
+        Ok(Executor(core, handles))
     }
 }
 

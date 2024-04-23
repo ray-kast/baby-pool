@@ -14,7 +14,8 @@ use std::{
 use crossbeam::queue::SegQueue;
 
 #[derive(Debug)]
-pub struct Mutex<T: ?Sized>(PhantomData<&'static T>);
+pub struct Mutex<T: ?Sized>(PhantomData<Box<T>>);
+#[derive(Debug)]
 pub struct MutexGuard<'a, T: ?Sized>(PhantomData<&'a mut T>);
 
 impl<T> Mutex<T> {
@@ -22,7 +23,9 @@ impl<T> Mutex<T> {
 }
 
 impl<T: ?Sized> Mutex<T> {
-    pub fn lock(&self) -> impl Future<Output = MutexGuard<'_, T>> { async move { MutexGuard(todo!()) } }
+    pub fn lock(&self) -> impl Future<Output = MutexGuard<'_, T>> {
+        async move { MutexGuard(todo!()) }
+    }
 }
 
 impl<'a, T> std::ops::Deref for MutexGuard<'a, T> {
@@ -35,10 +38,10 @@ impl<'a, T> std::ops::DerefMut for MutexGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target { todo!() }
 }
 
+#[derive(Debug)]
 pub struct Unpark(AtomicPtr<Waker>);
 
 impl Unpark {
-    const NEW: Self = Self::new();
     const UNPARKED: *mut Waker = NonNull::dangling().as_ptr();
     const UNPOLLED: *mut Waker = ptr::null_mut();
 
@@ -72,6 +75,7 @@ impl Drop for Unpark {
     }
 }
 
+#[derive(Debug)]
 pub struct Park(Arc<Unpark>);
 
 impl Future for Park {
@@ -99,8 +103,9 @@ impl Future for Park {
     }
 }
 
+#[must_use = "The future returned by park() must be awaited"]
 pub fn park() -> (Park, Weak<Unpark>) {
-    let unpark = Arc::new(Unpark::NEW);
+    let unpark = Arc::new(Unpark::new());
     let unpark_weak = Arc::downgrade(&unpark);
 
     (Park(unpark), unpark_weak)
@@ -109,8 +114,14 @@ pub fn park() -> (Park, Weak<Unpark>) {
 #[derive(Debug)]
 pub struct Condvar(SegQueue<Weak<Unpark>>);
 
+impl Default for Condvar {
+    #[inline]
+    fn default() -> Self { Self::new() }
+}
+
 impl Condvar {
     #[inline]
+    #[must_use]
     pub const fn new() -> Self { Self(SegQueue::new()) }
 
     pub fn wait<T>(&self, guard: &mut MutexGuard<'_, T>) -> Park {
