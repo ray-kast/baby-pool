@@ -1,87 +1,49 @@
-//! A simple FIFO work queue threadpool for data-parallel concurrency.
-//!
-//! This module is designed to parallelize breadth-first queue processing
-//! operations, such as the following:
-//!
-//! ```
-//! # use std::collections::VecDeque;
-//! # #[derive(Debug, Clone, Copy)] struct FooData;
-//! # #[derive(Debug, Clone, Copy)] struct BarData;
-//! # const initial_data: FooData = FooData;
-//! # fn process_foo(_: FooData) -> BarData { BarData }
-//! #
-//! enum Job {
-//!     Foo(FooData),
-//!     Bar(BarData),
-//! }
-//!
-//! let mut q = VecDeque::new();
-//!
-//! q.push_back(Job::Foo(initial_data));
-//!
-//! while let Some(job) = q.pop_front() {
-//!     match job {
-//!         Job::Foo(foo) => {
-//!             let bar = process_foo(foo);
-//!             q.push_back(Job::Bar(bar));
-//!         },
-//!         Job::Bar(bar) => {
-//!             println!("Bar: {:?}", bar);
-//!         },
-//!     }
-//! }
-//! ```
-//!
-//! Using `topograph`, the above can be written to use a threadpool like so:
-//!
-//! ```
-//! # use topograph::{prelude::*, threaded};
-//! # #[derive(Debug, Clone, Copy)] struct FooData;
-//! # #[derive(Debug, Clone, Copy)] struct BarData;
-//! # const initial_data: FooData = FooData;
-//! # fn process_foo(_: FooData) -> BarData { BarData }
-//! #
-//! # enum Job {
-//! #     Foo(FooData),
-//! #     Bar(BarData),
-//! # }
-//! let pool = threaded::Builder::default().build(|job, handle| match job {
-//!     Job::Foo(foo) => {
-//!         let bar = process_foo(foo);
-//!         handle.push(Job::Bar(bar));
-//!     },
-//!     Job::Bar(bar) => {
-//!         println!("Bar: {:?}", bar);
-//!     },
-//! }).unwrap();
-//!
-//! pool.push(Job::Foo(initial_data));
-//! pool.join();
-//! ```
-
 use std::{
+    future::Future,
     panic::{RefUnwindSafe, UnwindSafe},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    thread::JoinHandle,
 };
 
 use crossbeam::deque::{Injector, Steal, Stealer, Worker};
 use dispose::abort_on_panic;
-use parking_lot::{Condvar, Mutex};
 
+use self::{
+    condvar::{Condvar, Mutex},
+    runtime::{JoinHandle, Runtime},
+};
 use crate::prelude::*;
 
-/// Builder for a threaded executor
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Builder {
+mod condvar;
+mod runtime;
+pub mod unwind;
+
+// TODO: remove all instances of "thread" and "blocking"
+
+/// Builder for a non-blocking executor
+#[derive(Clone, Copy, Debug)]
+pub struct Builder<R> {
     lifo: bool,
-    num_threads: Option<usize>,
+    num_tasks: Option<usize>,
+    runtime: R,
 }
 
-impl Builder {
+impl<R: Default> Default for Builder<R> {
+    #[inline]
+    fn default() -> Self { Self::from_runtime(R::default()) }
+}
+
+impl<R> Builder<R> {
+    pub const fn from_runtime(runtime: R) -> Self {
+        Self {
+            lifo: false,
+            num_tasks: None,
+            runtime,
+        }
+    }
+
     /// Specify whether this executor should use a LIFO queue (default is FIFO).
     #[must_use]
     pub fn lifo(mut self, lifo: bool) -> Self {
@@ -89,27 +51,33 @@ impl Builder {
         self
     }
 
-    /// Specify the number of threads to use, or None to detect from `num_cpus`.
+    /// Specify the number of tasks to run concurrently, or None to detect from `num_cpus`.
     #[must_use]
-    pub fn num_threads(mut self, num: impl Into<Option<usize>>) -> Self {
-        self.num_threads = num.into();
+    pub fn num_tasks(mut self, num: impl Into<Option<usize>>) -> Self {
+        self.num_tasks = num.into();
         self
     }
 }
 
-impl<J: Send + UnwindSafe + 'static> ExecutorBuilder<J, Executor<J>> for Builder {
+impl<J: Send + UnwindSafe + 'static, R: Runtime, F: Future<Output = ()>>
+    ExecutorBuilder<J, Executor<J>, F> for Builder<R>
+{
     // TODO: when `!`
     type Error = std::convert::Infallible;
 
     fn build(
         self,
-        f: impl Fn(J, Handle<J>) + Send + Clone + RefUnwindSafe + 'static,
+        f: impl Fn(J, Handle<J>) -> F + Send + Clone + RefUnwindSafe + 'static,
     ) -> Result<Executor<J>, Self::Error> {
-        let Self { lifo, num_threads } = self;
+        let Self {
+            lifo,
+            num_tasks,
+            runtime,
+        } = self;
 
-        let num_threads = num_threads.unwrap_or_else(num_cpus::get);
+        let num_tasks = num_tasks.unwrap_or_else(num_cpus::get);
 
-        let work = (0..num_threads)
+        let work = (0..num_tasks)
             .map(|i| {
                 (
                     i,
@@ -132,30 +100,27 @@ impl<J: Send + UnwindSafe + 'static> ExecutorBuilder<J, Executor<J>> for Builder
             inj: Injector::new(),
             steal,
             stop: AtomicBool::new(false),
-            live: Mutex::new(num_threads),
+            live: Mutex::new(num_tasks),
             unpark_var: Condvar::new(),
             join_var: Condvar::new(),
         });
 
-        let threads = abort_on_panic({
+        let tasks = abort_on_panic({
             let core = &core;
             move || {
                 work.into_iter()
                     .map(|(index, work)| {
-                        std::thread::Builder::new()
-                            .name(format!("Worker thread {}", index))
-                            .spawn({
-                                let core = core.clone();
+                        runtime
+                            .spawn(format!("Worker task {index}"), {
+                                let core = Arc::clone(core);
                                 let f = f.clone();
 
-                                move || {
-                                    WorkerThread {
-                                        // index,
-                                        work,
-                                        core,
-                                    }
-                                    .run(f);
+                                WorkerTask {
+                                    // index,
+                                    work,
+                                    core,
                                 }
+                                .run(f)
                             })
                             .unwrap()
                     })
@@ -163,7 +128,7 @@ impl<J: Send + UnwindSafe + 'static> ExecutorBuilder<J, Executor<J>> for Builder
             }
         });
 
-        Ok(Executor(core, threads))
+        Ok(Executor(core, tasks))
     }
 }
 
@@ -203,31 +168,31 @@ impl<J> Core<J> {
     /// **NOTE:** Use with care!  This is not atomic.
     fn is_empty(&self) -> bool { self.inj.is_empty() && self.steal.iter().all(Stealer::is_empty) }
 
-    fn park(&self) {
+    async fn park(&self) {
         if self.stop.load(Ordering::SeqCst) {
             return;
         }
 
-        let mut live = self.live.lock();
+        let mut live = self.live.lock().await;
         *live -= 1;
 
         if *live == 0 {
             self.join_var.notify_all();
         }
 
-        self.unpark_var.wait(&mut live);
+        self.unpark_var.wait(&mut live).await;
         *live += 1;
     }
 
     /// # A note on soundness
     /// This only works because the exposed function consumes the thread pool,
-    /// revoking outside access to the push() function.  This makes `is_empty` a
+    /// revoking outside access to the ``push()`` function.  This makes `is_empty` a
     /// sound approximation as no items can be added if no threads are live.
-    fn join(&self) {
-        let mut live = self.live.lock();
+    async fn join(&self) {
+        let mut live = self.live.lock().await;
 
         while !(*live == 0 && self.is_empty()) {
-            self.join_var.wait(&mut live);
+            self.join_var.wait(&mut live).await;
         }
 
         self.abort();
@@ -252,11 +217,11 @@ impl<'a, J> ExecutorHandle<J> for Handle<'a, J> {
 impl<J> Executor<J> {
     /// Get the number of threads created for this executor
     #[must_use]
-    pub fn num_threads(&self) -> usize { self.1.len() }
+    pub fn num_tasks(&self) -> usize { self.1.len() }
 
-    fn join_threads(&mut self) {
+    async fn join_tasks(&mut self) {
         for handle in self.1.drain(..) {
-            handle.join().unwrap();
+            handle.await.unwrap();
         }
     }
 }
@@ -266,21 +231,23 @@ impl<J> ExecutorHandle<J> for Executor<J> {
     fn push(&self, job: J) { self.0.push(job); }
 }
 
-impl<J: Send + UnwindSafe + 'static> crate::Executor<J> for Executor<J> {
+impl<J: Send + UnwindSafe + 'static> ExecutorCore<J> for Executor<J> {
     type Handle<'a> = Handle<'a, J>;
+}
 
-    fn join(mut self) {
+impl<J: Send + UnwindSafe + 'static> ExecutorAsync<J> for Executor<J> {
+    async fn join(mut self) {
         self.0.join();
-        self.join_threads();
+        self.join_tasks();
 
         // Final sanity check
         assert!(self.0.is_empty(), "Thread pool starved!");
     }
 
     #[inline]
-    fn abort(mut self) {
+    async fn abort(mut self) {
         self.0.abort();
-        self.join_threads();
+        self.join_tasks();
     }
 }
 
@@ -288,17 +255,17 @@ impl<J> Drop for Executor<J> {
     fn drop(&mut self) { self.0.abort(); }
 }
 
-struct WorkerThread<J> {
+struct WorkerTask<J> {
     // Might expose in the future
     // index: usize,
     work: Worker<J>,
     core: Arc<Core<J>>,
 }
 
-impl<J: UnwindSafe> WorkerThread<J> {
+impl<J: UnwindSafe> WorkerTask<J> {
     fn get_job(&self) -> Option<J> {
         self.work.pop().or_else(|| {
-            let WorkerThread { work, .. } = self;
+            let WorkerTask { work, .. } = self;
             let Core {
                 ref stop,
                 ref inj,
@@ -323,13 +290,17 @@ impl<J: UnwindSafe> WorkerThread<J> {
         })
     }
 
-    fn run(self, f: impl Fn(J, Handle<J>) + RefUnwindSafe) {
-        abort_on_panic(move || {
+    async fn run<F: Future<Output = ()>>(self, f: impl Fn(J, Handle<J>) -> F + RefUnwindSafe) {
+        // TODO: propagate abort_on_panic
+        abort_on_panic(move || async move {
             while !self.core.stop.load(Ordering::Acquire) {
                 let handle = Handle(&self.core);
                 if let Some(job) = self.get_job() {
                     match std::panic::catch_unwind(|| f(job, handle)) {
-                        Ok(()) => (),
+                        Ok(f) => {
+                            f.await;
+                            todo!("catch_unwind");
+                        },
                         Err(e) => log::error!("Job panicked: {:?}", e),
                     }
                 } else {

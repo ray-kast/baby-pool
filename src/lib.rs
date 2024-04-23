@@ -1,12 +1,13 @@
 #![deny(
+    clippy::disallowed_methods,
     clippy::suspicious,
     clippy::style,
+    clippy::clone_on_ref_ptr,
     missing_debug_implementations,
-    missing_copy_implementations,
-    rustdoc::broken_intra_doc_links
+    missing_copy_implementations
 )]
-#![warn(clippy::pedantic, clippy::cargo, missing_docs)]
-#![feature(generic_associated_types)]
+#![warn(clippy::pedantic, missing_docs)]
+#![allow(clippy::module_name_repetitions)]
 
 //! A tiny library for doing basic synchronous thread scheduling.
 //!
@@ -19,10 +20,17 @@
 //! The documentation for each of the above modules contains example code for
 //! each use case.
 
-pub mod graph;
-pub mod threaded;
+// TODO: make sync and async dependencies optional
 
-use std::panic::{RefUnwindSafe, UnwindSafe};
+pub mod graph;
+pub mod nonblock;
+pub mod blocking;
+mod executor;
+
+use std::{
+    future::Future,
+    panic::{RefUnwindSafe, UnwindSafe},
+};
 
 pub use graph::ExecutorBuilderExt;
 
@@ -30,12 +38,13 @@ pub mod prelude {
     //! Common traits
 
     pub use super::{
-        graph::SchedulerCore, Executor, ExecutorBuilder, ExecutorBuilderExt, ExecutorHandle,
+        graph::SchedulerCore, ExecutorAsync, ExecutorBuilder, ExecutorBuilderExt, ExecutorCore,
+        ExecutorHandle, ExecutorSync,
     };
 }
 
 /// Builder type for an executor
-pub trait ExecutorBuilder<J: UnwindSafe, E: Executor<J>> {
+pub trait ExecutorBuilder<J: UnwindSafe, E: ExecutorCore<J>, F> {
     /// The error type for [`Self::build`]
     type Error: std::error::Error;
 
@@ -47,7 +56,7 @@ pub trait ExecutorBuilder<J: UnwindSafe, E: Executor<J>> {
     /// the executor.
     fn build(
         self,
-        work: impl Fn(J, E::Handle<'_>) + Send + Clone + RefUnwindSafe + 'static,
+        work: impl Fn(J, E::Handle<'_>) -> F + Send + Clone + RefUnwindSafe + 'static,
     ) -> Result<E, Self::Error>;
 }
 
@@ -58,11 +67,15 @@ pub trait ExecutorHandle<J> {
     fn push(&self, job: J);
 }
 
+// TODO: assert unwind safe in the right places
+
 /// Abstraction over a thread pool that executes jobs in a dependency-free queue
-pub trait Executor<J: UnwindSafe>: ExecutorHandle<J> + Sized {
+pub trait ExecutorCore<J: UnwindSafe>: ExecutorHandle<J> + Sized {
     /// The handle into this executor exposed to running jobs
     type Handle<'a>: ExecutorHandle<J> + Copy + UnwindSafe + RefUnwindSafe + 'a;
+}
 
+pub trait ExecutorSync<J: UnwindSafe>: ExecutorCore<J> {
     /// Disable pushing new jobs and wait for all pending work to complete,
     /// including jobs queued by currently-running jobs
     fn join(self);
@@ -70,4 +83,14 @@ pub trait Executor<J: UnwindSafe>: ExecutorHandle<J> + Sized {
     /// Disable pushing new jobs and wait for all currently-running jobs to
     /// finish before dropping the rest
     fn abort(self);
+}
+
+pub trait ExecutorAsync<J: UnwindSafe>: ExecutorCore<J> {
+    /// Disable pushing new jobs and wait for all pending work to complete,
+    /// including jobs queued by currently-running jobs
+    fn join(self) -> impl Future<Output = ()> + Send;
+
+    /// Disable pushing new jobs and wait for all currently-running jobs to
+    /// finish before dropping the rest
+    fn abort(self) -> impl Future<Output = ()> + Send;
 }

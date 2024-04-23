@@ -73,7 +73,7 @@ use thiserror::Error;
 use crate::prelude::*;
 
 /// The core interface for scheduling tasks with dependencies
-pub trait SchedulerCore<'a, J>: ExecutorHandle<J> {
+pub trait SchedulerCore<J>: ExecutorHandle<J> {
     /// Create a pending job
     ///
     /// # Panics
@@ -108,7 +108,7 @@ pub trait SchedulerCore<'a, J>: ExecutorHandle<J> {
     ) -> Arc<Dependents<J>> {
         let deps = Dependents::new(dependents.into_iter().collect());
 
-        self.push_with_dependents(payload, Some(deps.clone()));
+        self.push_with_dependents(payload, Some(Arc::clone(&deps)));
 
         deps
     }
@@ -217,7 +217,7 @@ pub struct Scheduler<J, E> {
 unsafe impl<J> Sync for Node<J> {}
 
 impl<J> Node<J> {
-    fn decrement<'a, H: SchedulerCore<'a, J>>(&self, handle: &H) {
+    fn decrement<H: SchedulerCore<J>>(&self, handle: &H) {
         match self.dependencies.fetch_sub(1, Ordering::SeqCst) {
             1 => {
                 let job = {
@@ -246,13 +246,14 @@ impl<J> Node<J> {
         }
     }
 
+    /// Returns `dependents` on error
     fn set_dependents(&self, dependents: Arc<Dependents<J>>) -> Result<(), Arc<Dependents<J>>> {
         let ptr = Arc::into_raw(dependents);
 
         self.dependents
             .compare_exchange(
                 ptr::null_mut(),
-                ptr as *mut Dependents<J>,
+                ptr.cast_mut(),
                 Ordering::SeqCst,
                 Ordering::Relaxed,
             )
@@ -344,17 +345,12 @@ impl<J> NodeBuilder<J> {
         &mut self, // NOTE: this mut is IMPORTANT!
         dependents: Arc<Dependents<J>>,
     ) -> Result<(), Arc<Dependents<J>>> {
-        let node = match self.node.as_ref() {
-            Some(n) => n,
-            None => return Err(dependents),
-        };
+        let Some(node) = self.node.as_ref() else { return Err(dependents) };
 
         debug_assert!(self.remaining > 0);
         debug_assert!(node.dependencies.load(Ordering::SeqCst) >= self.remaining);
 
-        if let Err(dependents) = node.set_dependents(dependents) {
-            return Err(dependents);
-        }
+        node.set_dependents(dependents)?;
 
         Ok(())
     }
@@ -380,7 +376,7 @@ impl<J> Dependents<J> {
     ///
     /// If the job associated with this list has already run, the job will be
     /// enqueued immediately.
-    pub fn push<'a, H: SchedulerCore<'a, J>>(&self, handle: &H, dependent: Edge<J>) {
+    pub fn push<H: SchedulerCore<J>>(&self, handle: &H, dependent: Edge<J>) {
         let this = self.0.upgradable_read();
 
         if this.is_some() {
@@ -462,7 +458,7 @@ impl<J> AdoptableDependents<J> {
     ///
     /// # Panics
     /// This function panics if the instance is found to be in a poisoned state.
-    pub fn push<'a, H: SchedulerCore<'a, J>>(&mut self, handle: &H, dependent: Edge<J>) {
+    pub fn push<H: SchedulerCore<J>>(&mut self, handle: &H, dependent: Edge<J>) {
         match self.0 {
             AdoptState::Orphan(ref mut deps) => {
                 deps.push(dependent);
@@ -485,7 +481,7 @@ impl<J> AdoptableDependents<J> {
     ///
     /// # Panics
     /// This function panics if the instance is found to be in a poisoned state.
-    pub fn adopt<'a, H: SchedulerCore<'a, J>>(
+    pub fn adopt<H: SchedulerCore<J>>(
         &mut self,
         handle: &H,
         dependents: Arc<Dependents<J>>,
@@ -553,7 +549,7 @@ impl<J> AdoptableDependents<J> {
     ///
     /// # Panics
     /// This function panics if the instance is found to be in a poisoned state.
-    pub fn complete<'a, H: SchedulerCore<'a, J>>(
+    pub fn complete<H: SchedulerCore<J>>(
         &mut self,
         handle: &H,
     ) -> Result<bool, BadAdoptState> {
@@ -600,7 +596,7 @@ impl<J> From<J> for Job<J> {
     }
 }
 
-impl<'a, J, H: ExecutorHandle<Job<J>>> SchedulerCore<'a, J> for Handle<H> {
+impl<J, H: ExecutorHandle<Job<J>>> SchedulerCore<J> for Handle<H> {
     fn create_node_or_run(&self, payload: J, dependencies: usize) -> Option<NodeBuilder<J>> {
         NodeBuilder::create_or_run(payload, dependencies, |j| self.0.push(j.into()))
     }
@@ -614,12 +610,12 @@ impl<'a, J, H: ExecutorHandle<Job<J>>> SchedulerCore<'a, J> for Handle<H> {
     }
 }
 
-impl<'a, J, H: ExecutorHandle<Job<J>>> ExecutorHandle<J> for Handle<H> {
+impl<J, H: ExecutorHandle<Job<J>>> ExecutorHandle<J> for Handle<H> {
     #[inline]
     fn push(&self, job: J) { self.0.push(job.into()); }
 }
 
-impl<J: UnwindSafe, E: Executor<Job<J>>> Scheduler<J, E>
+impl<J: UnwindSafe, E: ExecutorCore<Job<J>>> Scheduler<J, E>
 where for<'a> E::Handle<'a>: Clone
 {
     /// Construct a new graph scheduler
@@ -635,6 +631,7 @@ where for<'a> E::Handle<'a>: Clone
                   handle| {
                 let handle = Handle(handle);
 
+                #[allow(clippy::single_match)]
                 match f(payload, handle) {
                     Ok(()) => {
                         if let Some(dependents) = dependents.0 {
@@ -650,7 +647,7 @@ where for<'a> E::Handle<'a>: Clone
 
         Ok(Self {
             executor,
-            _m: PhantomData::default(),
+            _m: PhantomData,
         })
     }
 }
@@ -667,7 +664,7 @@ impl<J, E> std::ops::DerefMut for Scheduler<J, E> {
 
 /// Adds the [`build_graph`](ExecutorBuilderExt::build_graph) method to
 /// [`ExecutorBuilder`]
-pub trait ExecutorBuilderExt<J: UnwindSafe, E: Executor<Job<J>>>:
+pub trait ExecutorBuilderExt<J: UnwindSafe, E: ExecutorCore<Job<J>>>:
     Sized + ExecutorBuilder<Job<J>, E>
 {
     /// Construct a new graph scheduler using this builder's executor type
@@ -684,7 +681,7 @@ pub trait ExecutorBuilderExt<J: UnwindSafe, E: Executor<Job<J>>>:
     ) -> Result<Scheduler<J, E>, Self::Error>;
 }
 
-impl<J: UnwindSafe, E: Executor<Job<J>>, B: ExecutorBuilder<Job<J>, E> + Sized>
+impl<J: UnwindSafe, E: ExecutorCore<Job<J>>, B: ExecutorBuilder<Job<J>, E> + Sized>
     ExecutorBuilderExt<J, E> for B
 {
     fn build_graph(
@@ -699,14 +696,16 @@ impl<J: UnwindSafe, E: Executor<Job<J>>, B: ExecutorBuilder<Job<J>, E> + Sized>
     }
 }
 
-impl<J: UnwindSafe, E: Executor<Job<J>>> ExecutorHandle<J> for Scheduler<J, E> {
+impl<J: UnwindSafe, E: ExecutorCore<Job<J>>> ExecutorHandle<J> for Scheduler<J, E> {
     #[inline]
     fn push(&self, job: J) { self.executor.push(job.into()); }
 }
 
-impl<J: UnwindSafe, E: Executor<Job<J>>> Executor<J> for Scheduler<J, E> {
+impl<J: UnwindSafe, E: ExecutorCore<Job<J>>> ExecutorCore<J> for Scheduler<J, E> {
     type Handle<'a> = Handle<E::Handle<'a>>;
+}
 
+impl<J: UnwindSafe, E: ExecutorSync<Job<J>>> ExecutorSync<J> for Scheduler<J, E> {
     #[inline]
     fn join(self) { self.executor.join(); }
 
@@ -714,7 +713,19 @@ impl<J: UnwindSafe, E: Executor<Job<J>>> Executor<J> for Scheduler<J, E> {
     fn abort(self) { self.executor.abort(); }
 }
 
-impl<'a, J: UnwindSafe, E: Executor<Job<J>>> SchedulerCore<'a, J> for Scheduler<J, E> {
+impl<J: UnwindSafe, E: ExecutorAsync<Job<J>>> ExecutorAsync<J> for Scheduler<J, E> {
+    #[inline]
+    fn join(self) -> impl std::future::Future<Output = ()> + Send {
+        self.executor.join()
+    }
+
+    #[inline]
+    fn abort(self) -> impl std::future::Future<Output = ()> + Send {
+        self.executor.abort()
+    }
+}
+
+impl<J: UnwindSafe, E: ExecutorCore<Job<J>>> SchedulerCore<J> for Scheduler<J, E> {
     fn create_node_or_run(&self, payload: J, dependencies: usize) -> Option<NodeBuilder<J>> {
         NodeBuilder::create_or_run(payload, dependencies, |j| self.executor.push(j.into()))
     }

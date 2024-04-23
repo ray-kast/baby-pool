@@ -1,6 +1,6 @@
 [package]
 name = "topograph"
-version = "0.3.1-alpha.1"
+version = "0.4.0"
 authors = ["raykast <rookie1286@gmail.com>"]
 edition = "2021"
 description = "A miniscule thread pool and toposort scheduler"
@@ -16,7 +16,9 @@ categories = ["algorithms", "concurrency", "rust-patterns"]
 [dependencies]
 crossbeam = "0.8.1"
 dispose = "0.4.0"
+futures-util = "0.3.30"
 log = "0.4.14"
 num_cpus = "1.13.0"
 parking_lot = "0.11.2"
+pin-project = "1.1.5"
 thiserror = "1.0.30"
