@@ -22,30 +22,31 @@
 
 // TODO: make sync and async dependencies optional
 
+pub mod executor;
 pub mod graph;
 pub mod nonblock;
-mod executor;
 
 use std::{
     future::Future,
     panic::{RefUnwindSafe, UnwindSafe},
 };
 
-pub use graph::ExecutorBuilderExt;
-
 pub mod prelude {
     //! Common traits
 
     pub use super::{
-        graph::SchedulerCore, ExecutorAsync, ExecutorBuilder, ExecutorBuilderExt, ExecutorCore,
-        ExecutorHandle, ExecutorSync,
+        graph::{ExecutorBuilderExt, SchedulerCore},
+        ExecutorBuilder, ExecutorCore, ExecutorHandle,
     };
 }
 
+// TODO: clean up the API for this
 /// Builder type for an executor
-pub trait ExecutorBuilder<J: UnwindSafe, E: ExecutorCore<J>, F> {
+pub trait ExecutorBuilder<J: UnwindSafe, T> {
     /// The error type for [`Self::build`]
     type Error: std::error::Error;
+
+    type Executor: ExecutorCore<J>;
 
     /// Consume the builder, producing an executor
     ///
@@ -53,10 +54,16 @@ pub trait ExecutorBuilder<J: UnwindSafe, E: ExecutorCore<J>, F> {
     /// This function will fail if an error occurred previously while
     /// configuring the builder, or if an error occurred while initializing
     /// the executor.
-    fn build(
+    fn build<
+        F: Fn(J, <Self::Executor as ExecutorCore<J>>::Handle<'_>) -> T
+            + Clone
+            + RefUnwindSafe
+            + Send
+            + 'static,
+    >(
         self,
-        work: impl Fn(J, E::Handle<'_>) -> F + Send + Clone + RefUnwindSafe + 'static,
-    ) -> Result<E, Self::Error>;
+        work: F,
+    ) -> Result<Self::Executor, Self::Error>;
 }
 
 /// The smallest possible abstraction over an [`Executor`] and its associated
@@ -67,29 +74,10 @@ pub trait ExecutorHandle<J> {
 }
 
 // TODO: assert unwind safe in the right places
+// TODO: check usages of atomic ordering
 
 /// Abstraction over a thread pool that executes jobs in a dependency-free queue
 pub trait ExecutorCore<J: UnwindSafe>: ExecutorHandle<J> + Sized {
     /// The handle into this executor exposed to running jobs
     type Handle<'a>: ExecutorHandle<J> + Copy + UnwindSafe + RefUnwindSafe + 'a;
-}
-
-pub trait ExecutorSync<J: UnwindSafe>: ExecutorCore<J> {
-    /// Disable pushing new jobs and wait for all pending work to complete,
-    /// including jobs queued by currently-running jobs
-    fn join(self);
-
-    /// Disable pushing new jobs and wait for all currently-running jobs to
-    /// finish before dropping the rest
-    fn abort(self);
-}
-
-pub trait ExecutorAsync<J: UnwindSafe>: ExecutorCore<J> {
-    /// Disable pushing new jobs and wait for all pending work to complete,
-    /// including jobs queued by currently-running jobs
-    fn join(self) -> impl Future<Output = ()> + Send;
-
-    /// Disable pushing new jobs and wait for all currently-running jobs to
-    /// finish before dropping the rest
-    fn abort(self) -> impl Future<Output = ()> + Send;
 }

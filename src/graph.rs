@@ -5,7 +5,7 @@
 //! the following case:
 //!
 //! ```
-//! # use topograph::{prelude::*, threaded, graph};
+//! # use topograph::{prelude::*, executor, graph};
 //! # use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
 //! enum Job {
 //!     Foo,
@@ -17,13 +17,13 @@
 //! let data = Arc::new(AtomicU32::new(0));
 //! # let data_1 = data.clone();
 //!
-//! let pool = threaded::Builder::default().build_graph(move |job, handle| {
+//! let pool = executor::Builder::new(executor::Blocking).build_graph(move |job, handle| {
 //!     match job {
 //!         Job::Foo => {
 //!             let mut deps = handle.create_node(Job::Assert, 2);
 //!
-//!             handle.push_dependency(Job::Bar, Some(deps.take()));
-//!             handle.push_dependency(Job::Baz, Some(deps.take()));
+//!             handle.push_dependency(Job::Bar, Some(deps.get_in_edge()));
+//!             handle.push_dependency(Job::Baz, Some(deps.get_in_edge()));
 //!         },
 //!         Job::Bar => {
 //!             data.fetch_add(1, Ordering::SeqCst);
@@ -70,7 +70,7 @@ use std::{
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use thiserror::Error;
 
-use crate::prelude::*;
+use crate::{executor::{AsyncExecutor, Blocking, Executor, Nonblock}, prelude::*};
 
 /// The core interface for scheduling tasks with dependencies
 pub trait SchedulerCore<J>: ExecutorHandle<J> {
@@ -345,7 +345,9 @@ impl<J> NodeBuilder<J> {
         &mut self, // NOTE: this mut is IMPORTANT!
         dependents: Arc<Dependents<J>>,
     ) -> Result<(), Arc<Dependents<J>>> {
-        let Some(node) = self.node.as_ref() else { return Err(dependents) };
+        let Some(node) = self.node.as_ref() else {
+            return Err(dependents);
+        };
 
         debug_assert!(self.remaining > 0);
         debug_assert!(node.dependencies.load(Ordering::SeqCst) >= self.remaining);
@@ -549,10 +551,7 @@ impl<J> AdoptableDependents<J> {
     ///
     /// # Panics
     /// This function panics if the instance is found to be in a poisoned state.
-    pub fn complete<H: SchedulerCore<J>>(
-        &mut self,
-        handle: &H,
-    ) -> Result<bool, BadAdoptState> {
+    pub fn complete<H: SchedulerCore<J>>(&mut self, handle: &H) -> Result<bool, BadAdoptState> {
         match self.0 {
             AdoptState::Orphan(_) => (),
             AdoptState::Adopted(_) | AdoptState::Completed => return Ok(false),
@@ -619,9 +618,12 @@ impl<J: UnwindSafe, E: ExecutorCore<Job<J>>> Scheduler<J, E>
 where for<'a> E::Handle<'a>: Clone
 {
     /// Construct a new graph scheduler
-    fn new<B: ExecutorBuilder<Job<J>, E, ()>>(
+    fn new<
+        B: ExecutorBuilder<Job<J>, (), Executor = E>,
+        F: Fn(J, Handle<E::Handle<'_>>) -> Result<(), ()> + Clone + RefUnwindSafe + Send + 'static,
+    >(
         b: B,
-        f: impl Fn(J, Handle<E::Handle<'_>>) -> Result<(), ()> + Send + Clone + RefUnwindSafe + 'static,
+        f: F,
     ) -> Result<Self, B::Error> {
         let executor = b.build(
             move |Job {
@@ -664,34 +666,31 @@ impl<J, E> std::ops::DerefMut for Scheduler<J, E> {
 
 /// Adds the [`build_graph`](ExecutorBuilderExt::build_graph) method to
 /// [`ExecutorBuilder`]
-pub trait ExecutorBuilderExt<J: UnwindSafe, E: ExecutorCore<Job<J>>>:
-    Sized + ExecutorBuilder<Job<J>, E, ()>
-{
+pub trait ExecutorBuilderExt<J: UnwindSafe>: Sized + ExecutorBuilder<Job<J>, ()> {
+    // TODO: remove this impl Fn
     /// Construct a new graph scheduler using this builder's executor type
     ///
     /// # Errors
     /// This method fails if the underlying executor fails to build.
     fn build_graph(
         self,
-        work: impl Fn(J, Handle<E::Handle<'_>>) -> Result<(), ()>
+        work: impl Fn(J, Handle<<Self::Executor as ExecutorCore<Job<J>>>::Handle<'_>>) -> Result<(), ()>
         + Send
         + Clone
         + RefUnwindSafe
         + 'static,
-    ) -> Result<Scheduler<J, E>, Self::Error>;
+    ) -> Result<Scheduler<J, Self::Executor>, Self::Error>;
 }
 
-impl<J: UnwindSafe, E: ExecutorCore<Job<J>>, B: ExecutorBuilder<Job<J>, E, ()> + Sized>
-    ExecutorBuilderExt<J, E> for B
-{
+impl<J: UnwindSafe, B: ExecutorBuilder<Job<J>, ()> + Sized> ExecutorBuilderExt<J> for B {
     fn build_graph(
         self,
-        work: impl Fn(J, Handle<E::Handle<'_>>) -> Result<(), ()>
+        work: impl Fn(J, Handle<<B::Executor as ExecutorCore<Job<J>>>::Handle<'_>>) -> Result<(), ()>
         + Send
         + Clone
         + RefUnwindSafe
         + 'static,
-    ) -> Result<Scheduler<J, E>, Self::Error> {
+    ) -> Result<Scheduler<J, B::Executor>, Self::Error> {
         Scheduler::new(self, work)
     }
 }
@@ -705,23 +704,23 @@ impl<J: UnwindSafe, E: ExecutorCore<Job<J>>> ExecutorCore<J> for Scheduler<J, E>
     type Handle<'a> = Handle<E::Handle<'a>>;
 }
 
-impl<J: UnwindSafe, E: ExecutorSync<Job<J>>> ExecutorSync<J> for Scheduler<J, E> {
+impl<J: UnwindSafe + Send + 'static> Scheduler<J, Executor<J, Blocking>> {
     #[inline]
-    fn join(self) { self.executor.join(); }
+    pub fn join(self) { self.executor.join(); }
 
     #[inline]
-    fn abort(self) { self.executor.abort(); }
+    pub fn abort(self) { self.executor.abort(); }
 }
 
-impl<J: UnwindSafe, E: ExecutorAsync<Job<J>>> ExecutorAsync<J> for Scheduler<J, E> {
+impl<J: UnwindSafe + Send + 'static, E: AsyncExecutor> Scheduler<J, Executor<J, Nonblock<E>>> {
     #[inline]
-    fn join(self) -> impl std::future::Future<Output = ()> + Send {
-        self.executor.join()
+    pub fn join_async(self) -> impl std::future::Future<Output = ()> + Send {
+        self.executor.join_async()
     }
 
     #[inline]
-    fn abort(self) -> impl std::future::Future<Output = ()> + Send {
-        self.executor.abort()
+    pub fn abort_async(self) -> impl std::future::Future<Output = ()> + Send {
+        self.executor.abort_async()
     }
 }
 

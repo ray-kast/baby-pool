@@ -14,12 +14,12 @@ use std::{
 use crossbeam::queue::SegQueue;
 
 #[derive(Debug)]
-pub struct Mutex<T: ?Sized>(PhantomData<Box<T>>);
+pub struct Mutex<T: ?Sized>(parking_lot::Mutex<T>);
 #[derive(Debug)]
 pub struct MutexGuard<'a, T: ?Sized>(PhantomData<&'a mut T>);
 
 impl<T> Mutex<T> {
-    pub fn new(value: T) -> Self { Self(PhantomData) }
+    pub fn new(value: T) -> Self { Self(parking_lot::Mutex::new(value)) }
 }
 
 impl<T: ?Sized> Mutex<T> {
@@ -59,7 +59,7 @@ impl Unpark {
 
     #[inline]
     pub fn unpark(&self) {
-        let ptr = self.0.swap(Self::UNPARKED, Ordering::AcqRel);
+        let ptr = self.0.swap(Self::UNPARKED, Ordering::SeqCst);
         if let Some(waker) = unsafe { Self::get_waker(ptr) } {
             waker.wake();
         }
@@ -68,7 +68,7 @@ impl Unpark {
 
 impl Drop for Unpark {
     fn drop(&mut self) {
-        let ptr = self.0.swap(Self::UNPARKED, Ordering::AcqRel);
+        let ptr = self.0.swap(Self::UNPARKED, Ordering::SeqCst);
         if let Some(waker) = unsafe { Self::get_waker(ptr) } {
             drop(waker);
         }
@@ -86,7 +86,7 @@ impl Future for Park {
         let prev = self
             .0
             .0
-            .fetch_update(Ordering::Release, Ordering::Acquire, |p| {
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |p| {
                 (p == Unpark::UNPOLLED)
                     .then(|| *waker.get_or_init(|| Unpark::box_waker(cx.waker().clone().into())))
             });
@@ -130,25 +130,28 @@ impl Condvar {
         park
     }
 
-    pub fn notify_one(&self) {
+    pub fn notify_one(&self) -> bool {
         loop {
-            let Some(unpark) = self.0.pop() else { break };
+            let Some(unpark) = self.0.pop() else { break false };
             let Some(unpark) = unpark.upgrade() else {
                 continue;
             };
             unpark.unpark();
-            break;
+            break true;
         }
     }
 
-    pub fn notify_all(&self) {
+    pub fn notify_all(&self) -> usize {
+        let mut n = 0;
         for _ in 0..self.0.len() {
             let Some(unpark) = self.0.pop() else { break };
             let Some(unpark) = unpark.upgrade() else {
                 continue;
             };
             unpark.unpark();
-            break;
+            n += 1;
         }
+
+        n
     }
 }

@@ -1,19 +1,18 @@
 use std::{
-    fmt::Debug,
-    future::Future,
-    ops,
-    panic::{RefUnwindSafe, UnwindSafe},
-    sync::{
+    error::Error, fmt::Debug, future::Future, marker::PhantomData, panic::{RefUnwindSafe, UnwindSafe}, sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
-    },
+    }
 };
 
 use crossbeam::deque::{Injector, Steal, Stealer, Worker};
 use dispose::abort_on_panic;
 use futures_util::FutureExt;
 
-use crate::{nonblock::unwind::AbortOnPanic, prelude::*};
+use crate::{
+    nonblock::{condvar, unwind::AbortOnPanic},
+    prelude::*,
+};
 
 // TODO: check all trait bounds to see what can be relaxed
 
@@ -22,8 +21,7 @@ pub trait Runtime {
     type Mutex<T: Debug + Send>: Debug + Send + Sync;
     type Condvar: Debug + Send + Sync;
 
-    type JoinHandle<T>: Send;
-    type JoinError: Debug;
+    type JoinHandle<T: Send>: Send;
 
     fn new_mutex<T: Debug + Send>(value: T) -> Self::Mutex<T>;
 
@@ -34,50 +32,40 @@ pub trait Runtime {
     fn notify_all(cvar: &Self::Condvar) -> usize;
 }
 
-pub trait Spawn<F, J>: Runtime {
-    type Output;
-    type Error: std::error::Error;
+pub trait SpawnWorker<J, T>: Runtime + Sized {
+    type Error: Error;
 
-    fn spawn(
+    fn spawn_worker<F: Fn(J, Handle<J, Self>) -> T + RefUnwindSafe + Send + 'static>(
+        &self,
         name: String,
         worker: WorkerThread<J, Self>,
         f: F,
-    ) -> Result<Self::JoinHandle<Self::Output>, Self::Error>;
+    ) -> Result<Self::JoinHandle<()>, Self::Error>;
 }
 
-pub trait RuntimeSync: Runtime {
-    type MutexGuard<'a, T: 'a>: ops::Deref<Target = T> + ops::DerefMut;
+pub trait AsyncExecutor: Send + Sync + 'static {
+    type SpawnError: Error;
 
-    fn lock<T: Debug + Send>(mutex: &Self::Mutex<T>) -> Self::MutexGuard<'_, T>;
+    type JoinHandle<T: Send>: Send;
+    type JoinError: Error;
 
-    fn wait<T>(cvar: &Self::Condvar, guard: &mut Self::MutexGuard<'_, T>);
+    fn spawn<F: Future<Output = ()> + Send + 'static>(
+        &self,
+        name: String,
+        f: F,
+    ) -> Result<Self::JoinHandle<()>, Self::SpawnError>;
 
-    fn join<T>(handle: Self::JoinHandle<T>) -> Result<T, Self::JoinError>;
-}
-
-pub trait RuntimeAsync: Runtime {
-    type MutexGuard<'a, T>: ops::Deref<Target = T> + ops::DerefMut + Send;
-
-    fn lock<T: Debug + Send>(
-        mutex: &Self::Mutex<T>,
-    ) -> impl Future<Output = Self::MutexGuard<'_, T>> + Send;
-
-    fn wait<'a, T>(
-        cvar: &'a Self::Condvar,
-        guard: &mut Self::MutexGuard<'a, T>,
-    ) -> impl Future<Output = ()> + Send;
-
-    fn join<T>(
+    fn join<T: Send>(
         handle: Self::JoinHandle<T>,
     ) -> impl Future<Output = Result<T, Self::JoinError>> + Send;
 }
 
-struct Threaded;
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Blocking;
 
-impl Runtime for Threaded {
+impl Runtime for Blocking {
     type Condvar = parking_lot::Condvar;
-    type JoinError = Box<dyn std::any::Any + Send + 'static>;
-    type JoinHandle<T> = std::thread::JoinHandle<T>;
+    type JoinHandle<T: Send> = std::thread::JoinHandle<T>;
     type Mutex<T: Debug + Send> = parking_lot::Mutex<T>;
 
     #[inline]
@@ -93,109 +81,106 @@ impl Runtime for Threaded {
     fn notify_all(cvar: &Self::Condvar) -> usize { cvar.notify_all() }
 }
 
-impl<F: Fn(J, Handle<J, Self>) + RefUnwindSafe + Send + 'static, J: UnwindSafe + Send + 'static>
-    Spawn<F, J> for Threaded
-{
+impl<J: UnwindSafe + Send + 'static> SpawnWorker<J, ()> for Blocking {
     type Error = std::io::Error;
-    type Output = ();
 
-    fn spawn(
+    fn spawn_worker<F: Fn(J, Handle<J, Self>) + RefUnwindSafe + Send + 'static>(
+        &self,
         name: String,
         worker: WorkerThread<J, Self>,
         f: F,
-    ) -> Result<Self::JoinHandle<Self::Output>, Self::Error> {
+    ) -> Result<Self::JoinHandle<()>, Self::Error> {
         std::thread::Builder::new()
             .name(name)
             .spawn(move || worker.run_sync(f))
     }
 }
 
-impl RuntimeSync for Threaded {
-    type MutexGuard<'a, T: 'a> = parking_lot::MutexGuard<'a, T>;
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Nonblock<E>(pub E);
+
+impl<E: AsyncExecutor> Runtime for Nonblock<E> {
+    type Condvar = condvar::Condvar;
+    type JoinHandle<T: Send> = E::JoinHandle<T>;
+    type Mutex<T: Debug + Send> = condvar::Mutex<T>;
 
     #[inline]
-    fn lock<T: Debug + Send>(mutex: &Self::Mutex<T>) -> Self::MutexGuard<'_, T> { mutex.lock() }
+    fn new_mutex<T: Debug + Send>(value: T) -> Self::Mutex<T> { condvar::Mutex::new(value) }
 
-    #[inline]
-    fn wait<T>(cvar: &Self::Condvar, guard: &mut Self::MutexGuard<'_, T>) { cvar.wait(guard) }
+    fn new_condvar() -> Self::Condvar { condvar::Condvar::new() }
 
-    #[inline]
-    fn join<T>(handle: Self::JoinHandle<T>) -> Result<T, Self::JoinError> { handle.join() }
+    fn notify_one(cvar: &Self::Condvar) -> bool { cvar.notify_one() }
+
+    fn notify_all(cvar: &Self::Condvar) -> usize { cvar.notify_all() }
 }
 
-struct Nonblock;
+impl<J: UnwindSafe + Send + 'static, T: UnwindSafe + Send + Future<Output = ()> + 'static, E: AsyncExecutor>
+    SpawnWorker<J, T> for Nonblock<E>
+{
+    type Error = E::SpawnError;
 
-// impl Runtime for Nonblock {
-//     type Mutex<T: Debug + Send>;
+    #[inline]
+    fn spawn_worker<F: Fn(J, Handle<J, Self>) -> T + RefUnwindSafe + Send + 'static>(
+        &self,
+        name: String,
+        worker: WorkerThread<J, Self>,
+        f: F,
+    ) -> Result<Self::JoinHandle<()>, Self::Error> {
+        self.0.spawn(name, worker.run_async(f))
+    }
+}
 
-//     type Condvar;
+#[cfg(feature = "tokio")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Tokio;
 
-//     type JoinHandle<T>;
+#[cfg(feature = "tokio")]
+impl AsyncExecutor for Tokio {
+    type JoinError = tokio::task::JoinError;
+    type JoinHandle<T: Send> = tokio::task::JoinHandle<T>;
+    type SpawnError = std::convert::Infallible;
 
-//     type JoinError;
+    #[inline]
+    fn spawn<F: Future<Output = ()> + Send + 'static>(
+        &self,
+        name: String,
+        f: F,
+    ) -> Result<Self::JoinHandle<()>, Self::SpawnError> {
+        Ok(tokio::task::spawn(f))
+    }
 
-//     fn new_mutex<T: Debug + Send>(value: T) -> Self::Mutex<T> {
-//         todo!()
-//     }
-
-//     fn new_condvar() -> Self::Condvar {
-//         todo!()
-//     }
-
-//     fn notify_one(cvar: &Self::Condvar) -> bool {
-//         todo!()
-//     }
-
-//     fn notify_all(cvar: &Self::Condvar) -> usize {
-//         todo!()
-//     }
-// }
-
-// impl<F, J> Spawn<F, J> for Nonblock {
-//     type Output;
-
-//     type Error;
-
-//     fn spawn(
-//         name: String,
-//         worker: WorkerThread<J, Self>,
-//         f: F,
-//     ) -> Result<Self::JoinHandle<Self::Output>, Self::Error> {
-//         todo!()
-//     }
-// }
-
-// impl RuntimeAsync for Nonblock {
-//     type MutexGuard<'a, T>;
-
-//     fn lock<T: Debug + Send>(
-//         mutex: &Self::Mutex<T>,
-//     ) -> impl Future<Output = Self::MutexGuard<'_, T>> + Send {
-//         todo!()
-//     }
-
-//     fn wait<T>(
-//         cvar: &Self::Condvar,
-//         guard: &mut Self::MutexGuard<'_, T>,
-//     ) -> impl Future<Output = ()> + Send {
-//         todo!()
-//     }
-
-//     fn join<T>(
-//         handle: Self::JoinHandle<T>,
-//     ) -> impl Future<Output = Result<T, Self::JoinError>> + Send {
-//         todo!()
-//     }
-// }
+    #[inline]
+    fn join<T: Send>(
+        handle: Self::JoinHandle<T>,
+    ) -> impl Future<Output = Result<T, Self::JoinError>> + Send {
+        handle
+    }
+}
 
 /// Builder for a blocking executor
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Builder {
+#[derive(Clone, Copy, Debug)]
+pub struct Builder<J, R> {
     lifo: bool,
     num_threads: Option<usize>,
+    runtime: R,
+    phantom: PhantomData<fn(J)>,
 }
 
-impl Builder {
+impl<J, R: Default> Default for Builder<J, R> {
+    #[inline]
+    fn default() -> Self { Self::new(R::default()) }
+}
+
+impl<J, R> Builder<J, R> {
+    pub fn new(runtime: R) -> Self {
+        Self {
+            lifo: false,
+            num_threads: None,
+            runtime,
+            phantom: PhantomData,
+        }
+    }
+
     /// Specify whether this executor should use a LIFO queue (default is FIFO).
     #[must_use]
     pub fn lifo(mut self, lifo: bool) -> Self {
@@ -213,12 +198,28 @@ impl Builder {
 
 // TODO: remove usages of impl Trait where it muddies the API
 
-impl Builder {
-    pub fn build<J, R: Spawn<F, J, Output = ()> + ?Sized, F: Clone>(
+impl<J: UnwindSafe + Send + 'static, T, R: SpawnWorker<J, T> + 'static> ExecutorBuilder<J, T>
+    for Builder<J, R>
+{
+    type Error = R::Error;
+    type Executor = Executor<J, R>;
+
+    fn build<
+        F: Fn(J, <Self::Executor as ExecutorCore<J>>::Handle<'_>) -> T
+            + Clone
+            + RefUnwindSafe
+            + Send
+            + 'static,
+    >(
         self,
         f: F,
     ) -> Result<Executor<J, R>, R::Error> {
-        let Self { lifo, num_threads } = self;
+        let Self {
+            lifo,
+            num_threads,
+            runtime,
+            phantom: _,
+        } = self;
 
         let num_threads = num_threads.unwrap_or_else(num_cpus::get);
 
@@ -252,13 +253,14 @@ impl Builder {
 
         let handles = abort_on_panic({
             let core = &core;
+            let runtime = &runtime;
             move || {
                 work.into_iter()
                     .map(|(index, work)| {
                         let name = format!("Worker thread {index}");
                         let core = Arc::clone(core);
 
-                        R::spawn(
+                        runtime.spawn_worker(
                             name,
                             WorkerThread {
                                 // index,
@@ -308,6 +310,11 @@ impl<'a, J, R: Runtime + ?Sized> RefUnwindSafe for Handle<'a, J, R> {}
 #[derive(Debug)]
 pub struct Executor<J, R: Runtime + ?Sized>(Arc<Core<J, R>>, Vec<R::JoinHandle<()>>);
 
+impl<J, R: Runtime> Executor<J, R> {
+    #[inline]
+    pub fn builder(runtime: R) -> Builder<J, R> { Builder::new(runtime) }
+}
+
 impl<J, R: Runtime + ?Sized> Core<J, R> {
     /// **NOTE:** Use with care!  This is not atomic.
     fn is_empty(&self) -> bool { self.inj.is_empty() && self.steal.iter().all(Stealer::is_empty) }
@@ -323,20 +330,20 @@ impl<J, R: Runtime + ?Sized> Core<J, R> {
     }
 }
 
-impl<J, R: RuntimeSync + ?Sized> Core<J, R> {
+impl<J> Core<J, Blocking> {
     fn park_sync(&self) {
         if self.stop.load(Ordering::SeqCst) {
             return;
         }
 
-        let mut live = R::lock(&self.live);
+        let mut live = self.live.lock();
         *live -= 1;
 
         if *live == 0 {
-            R::notify_all(&self.join_var);
+            self.join_var.notify_all();
         }
 
-        R::wait(&self.unpark_var, &mut live);
+        self.unpark_var.wait(&mut live);
         *live += 1;
     }
 
@@ -345,30 +352,30 @@ impl<J, R: RuntimeSync + ?Sized> Core<J, R> {
     /// revoking outside access to the ``push()`` function.  This makes `is_empty` a
     /// sound approximation as no items can be added if no threads are live.
     fn join_sync(&self) {
-        let mut live = R::lock(&self.live);
+        let mut live = self.live.lock();
 
         while !(*live == 0 && self.is_empty()) {
-            R::wait(&self.join_var, &mut live);
+            self.join_var.wait(&mut live);
         }
 
         self.abort();
     }
 }
 
-impl<J, R: RuntimeAsync + ?Sized> Core<J, R> {
+impl<J, E: AsyncExecutor> Core<J, Nonblock<E>> {
     async fn park_async(&self) {
         if self.stop.load(Ordering::SeqCst) {
             return;
         }
 
-        let mut live = R::lock(&self.live).await;
+        let mut live = self.live.lock().await;
         *live -= 1;
 
         if *live == 0 {
-            R::notify_all(&self.join_var);
+            self.join_var.notify_all();
         }
 
-        R::wait(&self.unpark_var, &mut live).await;
+        self.unpark_var.wait(&mut live).await;
         *live += 1;
     }
 
@@ -377,10 +384,10 @@ impl<J, R: RuntimeAsync + ?Sized> Core<J, R> {
     /// revoking outside access to the ``push()`` function.  This makes `is_empty` a
     /// sound approximation as no items can be added if no threads are live.
     async fn join_async(&self) {
-        let mut live = R::lock(&self.live).await;
+        let mut live = self.live.lock().await;
 
         while !(*live == 0 && self.is_empty()) {
-            R::wait(&self.join_var, &mut live).await;
+            self.join_var.wait(&mut live).await;
         }
 
         self.abort();
@@ -398,18 +405,18 @@ impl<J, R: Runtime + ?Sized> Executor<J, R> {
     pub fn num_threads(&self) -> usize { self.1.len() }
 }
 
-impl<J, R: RuntimeSync + ?Sized> Executor<J, R> {
-    fn join_sync(&mut self) {
+impl<J> Executor<J, Blocking> {
+    fn join_handles_sync(&mut self) {
         for handle in self.1.drain(..) {
-            R::join(handle).unwrap();
+            handle.join().unwrap();
         }
     }
 }
 
-impl<J, R: RuntimeAsync + ?Sized> Executor<J, R> {
-    async fn join_async(&mut self) {
+impl<J, E: AsyncExecutor> Executor<J, Nonblock<E>> {
+    async fn join_handles_async(&mut self) {
         for handle in self.1.drain(..) {
-            R::join(handle).await.unwrap();
+            E::join(handle).await.unwrap();
         }
     }
 }
@@ -425,39 +432,35 @@ impl<J: Send + UnwindSafe + 'static, R: Runtime + ?Sized + 'static> ExecutorCore
     type Handle<'a> = Handle<'a, J, R>;
 }
 
-impl<J: Send + UnwindSafe + 'static, R: RuntimeSync + ?Sized + 'static> ExecutorSync<J>
-    for Executor<J, R>
-{
-    fn join(mut self) {
+impl<J: Send + UnwindSafe + 'static> Executor<J, Blocking> {
+    pub fn join(mut self) {
         self.0.join_sync();
-        self.join_sync();
+        self.join_handles_sync();
 
         // Final sanity check
         assert!(self.0.is_empty(), "Thread pool starved!");
     }
 
     #[inline]
-    fn abort(mut self) {
+    pub fn abort(mut self) {
         self.0.abort();
-        self.join_sync();
+        self.join_handles_sync();
     }
 }
 
-impl<J: Send + UnwindSafe + 'static, R: RuntimeAsync + ?Sized + 'static> ExecutorAsync<J>
-    for Executor<J, R>
-{
-    async fn join(mut self) {
+impl<J: Send + UnwindSafe + 'static, E: AsyncExecutor> Executor<J, Nonblock<E>> {
+    pub async fn join_async(mut self) {
         self.0.join_async().await;
-        self.join_async().await;
+        self.join_handles_async().await;
 
         // Final sanity check
         assert!(self.0.is_empty(), "Thread pool starved!");
     }
 
     #[inline]
-    async fn abort(mut self) {
+    pub async fn abort_async(mut self) {
         self.0.abort();
-        self.join_async().await;
+        self.join_handles_async().await;
     }
 }
 
@@ -501,8 +504,8 @@ impl<J: UnwindSafe, R: Runtime + ?Sized> WorkerThread<J, R> {
     }
 }
 
-impl<J: UnwindSafe, R: RuntimeSync + ?Sized> WorkerThread<J, R> {
-    fn run_sync(self, f: impl Fn(J, Handle<J, R>) + RefUnwindSafe) {
+impl<J: UnwindSafe> WorkerThread<J, Blocking> {
+    fn run_sync(self, f: impl Fn(J, Handle<J, Blocking>) + RefUnwindSafe) {
         abort_on_panic(move || {
             while !self.core.stop.load(Ordering::Acquire) {
                 let handle = Handle(&self.core);
@@ -519,10 +522,10 @@ impl<J: UnwindSafe, R: RuntimeSync + ?Sized> WorkerThread<J, R> {
     }
 }
 
-impl<J: UnwindSafe + Send, R: RuntimeAsync + ?Sized> WorkerThread<J, R> {
+impl<J: UnwindSafe + Send, E: AsyncExecutor> WorkerThread<J, Nonblock<E>> {
     fn run_async<F: Future<Output = ()> + UnwindSafe + Send>(
         self,
-        f: impl Fn(J, Handle<J, R>) -> F + RefUnwindSafe + Send,
+        f: impl Fn(J, Handle<J, Nonblock<E>>) -> F + RefUnwindSafe + Send,
     ) -> impl Future<Output = ()> + Send {
         AbortOnPanic(async move {
             while !self.core.stop.load(Ordering::Acquire) {
