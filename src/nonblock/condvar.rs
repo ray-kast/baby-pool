@@ -23,9 +23,7 @@ impl<T> Mutex<T> {
 }
 
 impl<T: ?Sized> Mutex<T> {
-    pub fn lock(&self) -> impl Future<Output = MutexGuard<'_, T>> {
-        async move { MutexGuard(todo!()) }
-    }
+    pub async fn lock(&self) -> MutexGuard<'_, T> { MutexGuard(todo!()) }
 }
 
 impl<'a, T> std::ops::Deref for MutexGuard<'a, T> {
@@ -132,7 +130,9 @@ impl Condvar {
 
     pub fn notify_one(&self) -> bool {
         loop {
-            let Some(unpark) = self.0.pop() else { break false };
+            let Some(unpark) = self.0.pop() else {
+                break false;
+            };
             let Some(unpark) = unpark.upgrade() else {
                 continue;
             };

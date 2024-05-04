@@ -59,7 +59,6 @@ use std::{
     mem,
     mem::{ManuallyDrop, MaybeUninit},
     ops,
-    panic::{AssertUnwindSafe, RefUnwindSafe, UnwindSafe},
     ptr,
     sync::{
         atomic::{AtomicPtr, AtomicUsize, Ordering},
@@ -190,7 +189,7 @@ pub struct AdoptableDependents<J>(AdoptState<J>);
 /// `Sync` impls
 #[derive(Debug)]
 #[repr(transparent)]
-pub struct RcAdoptableDependents<J>(AssertUnwindSafe<Arc<Mutex<AdoptableDependents<J>>>>);
+pub struct RcAdoptableDependents<J>(Arc<Mutex<AdoptableDependents<J>>>);
 
 type OptRcDependents<J> = Option<Arc<Dependents<J>>>;
 
@@ -198,7 +197,7 @@ type OptRcDependents<J> = Option<Arc<Dependents<J>>>;
 #[derive(Debug)]
 pub struct Job<J> {
     payload: J,
-    dependents: AssertUnwindSafe<OptRcDependents<J>>,
+    dependents: OptRcDependents<J>,
 }
 
 /// A handle into the graph scheduler for running jobs
@@ -209,7 +208,7 @@ pub struct Handle<H>(H);
 #[derive(Debug)]
 pub struct Scheduler<J, E> {
     executor: E,
-    _m: PhantomData<AssertUnwindSafe<J>>,
+    _m: PhantomData<J>,
 }
 
 // Rationale: J can only be accessed by the last dependency as it polls this
@@ -404,9 +403,6 @@ impl<J> std::iter::FromIterator<Edge<J>> for Arc<Dependents<J>> {
     }
 }
 
-impl<J> UnwindSafe for AdoptableDependents<J> {}
-impl<J> RefUnwindSafe for AdoptableDependents<J> {}
-
 impl<J> AdoptableDependents<J> {
     /// Construct a new `AdoptableDependents` in its initial "orphan" state.
     ///
@@ -444,7 +440,7 @@ impl<J> AdoptableDependents<J> {
     #[inline]
     #[must_use]
     pub fn rc(self) -> RcAdoptableDependents<J> {
-        RcAdoptableDependents(AssertUnwindSafe(Arc::new(Mutex::new(self))))
+        RcAdoptableDependents(Arc::new(Mutex::new(self)))
     }
 
     /// Add an edge to the list of dependents.
@@ -582,7 +578,7 @@ impl<J> ops::Deref for RcAdoptableDependents<J> {
 }
 
 impl<J> Clone for RcAdoptableDependents<J> {
-    fn clone(&self) -> Self { Self(AssertUnwindSafe(self.0.clone())) }
+    fn clone(&self) -> Self { Self(Arc::clone(&self.0)) }
 }
 
 impl<J> From<J> for Job<J> {
@@ -590,7 +586,7 @@ impl<J> From<J> for Job<J> {
     fn from(payload: J) -> Self {
         Self {
             payload,
-            dependents: AssertUnwindSafe(None),
+            dependents: None,
         }
     }
 }
@@ -604,7 +600,7 @@ impl<J, H: ExecutorHandle<Job<J>>> SchedulerCore<J> for Handle<H> {
     fn push_with_dependents(&self, payload: J, dependents: OptRcDependents<J>) {
         self.0.push(Job {
             payload,
-            dependents: AssertUnwindSafe(dependents),
+            dependents,
         });
     }
 }
@@ -614,13 +610,13 @@ impl<J, H: ExecutorHandle<Job<J>>> ExecutorHandle<J> for Handle<H> {
     fn push(&self, job: J) { self.0.push(job.into()); }
 }
 
-impl<J: UnwindSafe, E: ExecutorCore<Job<J>>> Scheduler<J, E>
+impl<J, E: ExecutorCore<Job<J>>> Scheduler<J, E>
 where for<'a> E::Handle<'a>: Clone
 {
     /// Construct a new graph scheduler
     fn new<
         B: ExecutorBuilder<Job<J>, (), Executor = E>,
-        F: Fn(J, Handle<E::Handle<'_>>) -> Result<(), ()> + Clone + RefUnwindSafe + Send + 'static,
+        F: Fn(J, Handle<E::Handle<'_>>) -> Result<(), ()> + Clone + Send + 'static,
     >(
         b: B,
         f: F,
@@ -636,7 +632,7 @@ where for<'a> E::Handle<'a>: Clone
                 #[allow(clippy::single_match)]
                 match f(payload, handle) {
                     Ok(()) => {
-                        if let Some(dependents) = dependents.0 {
+                        if let Some(dependents) = dependents {
                             for dep in mem::take(&mut *dependents.0.write()).into_iter().flatten() {
                                 dep.to.decrement(&handle);
                             }
@@ -666,7 +662,7 @@ impl<J, E> std::ops::DerefMut for Scheduler<J, E> {
 
 /// Adds the [`build_graph`](ExecutorBuilderExt::build_graph) method to
 /// [`ExecutorBuilder`]
-pub trait ExecutorBuilderExt<J: UnwindSafe>: Sized + ExecutorBuilder<Job<J>, ()> {
+pub trait ExecutorBuilderExt<J>: Sized + ExecutorBuilder<Job<J>, ()> {
     // TODO: remove this impl Fn
     /// Construct a new graph scheduler using this builder's executor type
     ///
@@ -677,34 +673,32 @@ pub trait ExecutorBuilderExt<J: UnwindSafe>: Sized + ExecutorBuilder<Job<J>, ()>
         work: impl Fn(J, Handle<<Self::Executor as ExecutorCore<Job<J>>>::Handle<'_>>) -> Result<(), ()>
         + Send
         + Clone
-        + RefUnwindSafe
         + 'static,
     ) -> Result<Scheduler<J, Self::Executor>, Self::Error>;
 }
 
-impl<J: UnwindSafe, B: ExecutorBuilder<Job<J>, ()> + Sized> ExecutorBuilderExt<J> for B {
+impl<J, B: ExecutorBuilder<Job<J>, ()> + Sized> ExecutorBuilderExt<J> for B {
     fn build_graph(
         self,
         work: impl Fn(J, Handle<<B::Executor as ExecutorCore<Job<J>>>::Handle<'_>>) -> Result<(), ()>
         + Send
         + Clone
-        + RefUnwindSafe
         + 'static,
     ) -> Result<Scheduler<J, B::Executor>, Self::Error> {
         Scheduler::new(self, work)
     }
 }
 
-impl<J: UnwindSafe, E: ExecutorCore<Job<J>>> ExecutorHandle<J> for Scheduler<J, E> {
+impl<J, E: ExecutorCore<Job<J>>> ExecutorHandle<J> for Scheduler<J, E> {
     #[inline]
     fn push(&self, job: J) { self.executor.push(job.into()); }
 }
 
-impl<J: UnwindSafe, E: ExecutorCore<Job<J>>> ExecutorCore<J> for Scheduler<J, E> {
+impl<J, E: ExecutorCore<Job<J>>> ExecutorCore<J> for Scheduler<J, E> {
     type Handle<'a> = Handle<E::Handle<'a>>;
 }
 
-impl<J: UnwindSafe + Send + 'static> Scheduler<J, Executor<J, Blocking>> {
+impl<J: Send + 'static> Scheduler<J, Executor<J, Blocking>> {
     #[inline]
     pub fn join(self) { self.executor.join(); }
 
@@ -712,7 +706,7 @@ impl<J: UnwindSafe + Send + 'static> Scheduler<J, Executor<J, Blocking>> {
     pub fn abort(self) { self.executor.abort(); }
 }
 
-impl<J: UnwindSafe + Send + 'static, E: AsyncExecutor> Scheduler<J, Executor<J, Nonblock<E>>> {
+impl<J: Send + 'static, E: AsyncExecutor> Scheduler<J, Executor<J, Nonblock<E>>> {
     #[inline]
     pub fn join_async(self) -> impl std::future::Future<Output = ()> + Send {
         self.executor.join_async()
@@ -724,7 +718,7 @@ impl<J: UnwindSafe + Send + 'static, E: AsyncExecutor> Scheduler<J, Executor<J, 
     }
 }
 
-impl<J: UnwindSafe, E: ExecutorCore<Job<J>>> SchedulerCore<J> for Scheduler<J, E> {
+impl<J, E: ExecutorCore<Job<J>>> SchedulerCore<J> for Scheduler<J, E> {
     fn create_node_or_run(&self, payload: J, dependencies: usize) -> Option<NodeBuilder<J>> {
         NodeBuilder::create_or_run(payload, dependencies, |j| self.executor.push(j.into()))
     }
@@ -733,7 +727,7 @@ impl<J: UnwindSafe, E: ExecutorCore<Job<J>>> SchedulerCore<J> for Scheduler<J, E
     fn push_with_dependents(&self, payload: J, dependents: OptRcDependents<J>) {
         self.executor.push(Job {
             payload,
-            dependents: AssertUnwindSafe(dependents),
+            dependents,
         });
     }
 }

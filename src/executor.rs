@@ -1,5 +1,5 @@
 use std::{
-    error::Error, fmt::Debug, future::Future, marker::PhantomData, panic::{RefUnwindSafe, UnwindSafe}, sync::{
+    error::Error, fmt::Debug, future::Future, marker::PhantomData, panic::AssertUnwindSafe, sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     }
@@ -35,7 +35,7 @@ pub trait Runtime {
 pub trait SpawnWorker<J, T>: Runtime + Sized {
     type Error: Error;
 
-    fn spawn_worker<F: Fn(J, Handle<J, Self>) -> T + RefUnwindSafe + Send + 'static>(
+    fn spawn_worker<F: Fn(J, Handle<J, Self>) -> T + Send + 'static>(
         &self,
         name: String,
         worker: WorkerThread<J, Self>,
@@ -81,10 +81,10 @@ impl Runtime for Blocking {
     fn notify_all(cvar: &Self::Condvar) -> usize { cvar.notify_all() }
 }
 
-impl<J: UnwindSafe + Send + 'static> SpawnWorker<J, ()> for Blocking {
+impl<J: Send + 'static> SpawnWorker<J, ()> for Blocking {
     type Error = std::io::Error;
 
-    fn spawn_worker<F: Fn(J, Handle<J, Self>) + RefUnwindSafe + Send + 'static>(
+    fn spawn_worker<F: Fn(J, Handle<J, Self>) + Send + 'static>(
         &self,
         name: String,
         worker: WorkerThread<J, Self>,
@@ -114,13 +114,13 @@ impl<E: AsyncExecutor> Runtime for Nonblock<E> {
     fn notify_all(cvar: &Self::Condvar) -> usize { cvar.notify_all() }
 }
 
-impl<J: UnwindSafe + Send + 'static, T: UnwindSafe + Send + Future<Output = ()> + 'static, E: AsyncExecutor>
+impl<J: Send + 'static, T: Send + Future<Output = ()> + 'static, E: AsyncExecutor>
     SpawnWorker<J, T> for Nonblock<E>
 {
     type Error = E::SpawnError;
 
     #[inline]
-    fn spawn_worker<F: Fn(J, Handle<J, Self>) -> T + RefUnwindSafe + Send + 'static>(
+    fn spawn_worker<F: Fn(J, Handle<J, Self>) -> T + Send + 'static>(
         &self,
         name: String,
         worker: WorkerThread<J, Self>,
@@ -198,7 +198,7 @@ impl<J, R> Builder<J, R> {
 
 // TODO: remove usages of impl Trait where it muddies the API
 
-impl<J: UnwindSafe + Send + 'static, T, R: SpawnWorker<J, T> + 'static> ExecutorBuilder<J, T>
+impl<J: Send + 'static, T, R: SpawnWorker<J, T> + 'static> ExecutorBuilder<J, T>
     for Builder<J, R>
 {
     type Error = R::Error;
@@ -207,7 +207,6 @@ impl<J: UnwindSafe + Send + 'static, T, R: SpawnWorker<J, T> + 'static> Executor
     fn build<
         F: Fn(J, <Self::Executor as ExecutorCore<J>>::Handle<'_>) -> T
             + Clone
-            + RefUnwindSafe
             + Send
             + 'static,
     >(
@@ -299,9 +298,6 @@ impl<'a, J, R: Runtime + ?Sized> Copy for Handle<'a, J, R> {}
 impl<'a, J, R: Runtime + ?Sized> Clone for Handle<'a, J, R> {
     fn clone(&self) -> Self { *self }
 }
-
-impl<'a, J, R: Runtime + ?Sized> UnwindSafe for Handle<'a, J, R> {}
-impl<'a, J, R: Runtime + ?Sized> RefUnwindSafe for Handle<'a, J, R> {}
 
 /// Container and main executor for a FIFO thread pool.
 ///
@@ -426,13 +422,13 @@ impl<J, R: Runtime + ?Sized> ExecutorHandle<J> for Executor<J, R> {
     fn push(&self, job: J) { self.0.push(job); }
 }
 
-impl<J: Send + UnwindSafe + 'static, R: Runtime + ?Sized + 'static> ExecutorCore<J>
+impl<J: Send + 'static, R: Runtime + ?Sized + 'static> ExecutorCore<J>
     for Executor<J, R>
 {
     type Handle<'a> = Handle<'a, J, R>;
 }
 
-impl<J: Send + UnwindSafe + 'static> Executor<J, Blocking> {
+impl<J: Send + 'static> Executor<J, Blocking> {
     pub fn join(mut self) {
         self.0.join_sync();
         self.join_handles_sync();
@@ -448,7 +444,7 @@ impl<J: Send + UnwindSafe + 'static> Executor<J, Blocking> {
     }
 }
 
-impl<J: Send + UnwindSafe + 'static, E: AsyncExecutor> Executor<J, Nonblock<E>> {
+impl<J: Send + 'static, E: AsyncExecutor> Executor<J, Nonblock<E>> {
     pub async fn join_async(mut self) {
         self.0.join_async().await;
         self.join_handles_async().await;
@@ -475,7 +471,7 @@ struct WorkerThread<J, R: Runtime + ?Sized> {
     core: Arc<Core<J, R>>,
 }
 
-impl<J: UnwindSafe, R: Runtime + ?Sized> WorkerThread<J, R> {
+impl<J, R: Runtime + ?Sized> WorkerThread<J, R> {
     fn get_job(&self) -> Option<J> {
         self.work.pop().or_else(|| {
             let WorkerThread { work, .. } = self;
@@ -504,13 +500,13 @@ impl<J: UnwindSafe, R: Runtime + ?Sized> WorkerThread<J, R> {
     }
 }
 
-impl<J: UnwindSafe> WorkerThread<J, Blocking> {
-    fn run_sync(self, f: impl Fn(J, Handle<J, Blocking>) + RefUnwindSafe) {
+impl<J> WorkerThread<J, Blocking> {
+    fn run_sync(self, f: impl Fn(J, Handle<J, Blocking>)) {
         abort_on_panic(move || {
             while !self.core.stop.load(Ordering::Acquire) {
                 let handle = Handle(&self.core);
                 if let Some(job) = self.get_job() {
-                    match std::panic::catch_unwind(|| f(job, handle)) {
+                    match std::panic::catch_unwind(AssertUnwindSafe(|| f(job, handle))) {
                         Ok(()) => (),
                         Err(e) => log::error!("Job panicked: {:?}", e),
                     }
@@ -522,16 +518,16 @@ impl<J: UnwindSafe> WorkerThread<J, Blocking> {
     }
 }
 
-impl<J: UnwindSafe + Send, E: AsyncExecutor> WorkerThread<J, Nonblock<E>> {
-    fn run_async<F: Future<Output = ()> + UnwindSafe + Send>(
+impl<J: Send, E: AsyncExecutor> WorkerThread<J, Nonblock<E>> {
+    fn run_async<F: Future<Output = ()> + Send>(
         self,
-        f: impl Fn(J, Handle<J, Nonblock<E>>) -> F + RefUnwindSafe + Send,
+        f: impl Fn(J, Handle<J, Nonblock<E>>) -> F + Send,
     ) -> impl Future<Output = ()> + Send {
         AbortOnPanic(async move {
             while !self.core.stop.load(Ordering::Acquire) {
                 let handle = Handle(&self.core);
                 if let Some(job) = self.get_job() {
-                    match f(job, handle).catch_unwind().await {
+                    match AssertUnwindSafe(f(job, handle)).catch_unwind().await {
                         Ok(()) => (),
                         Err(e) => log::error!("Job panicked: {:?}", e),
                     }

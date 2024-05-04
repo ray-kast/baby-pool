@@ -26,11 +26,6 @@ pub mod executor;
 pub mod graph;
 pub mod nonblock;
 
-use std::{
-    future::Future,
-    panic::{RefUnwindSafe, UnwindSafe},
-};
-
 pub mod prelude {
     //! Common traits
 
@@ -42,7 +37,7 @@ pub mod prelude {
 
 // TODO: clean up the API for this
 /// Builder type for an executor
-pub trait ExecutorBuilder<J: UnwindSafe, T> {
+pub trait ExecutorBuilder<J, T> {
     /// The error type for [`Self::build`]
     type Error: std::error::Error;
 
@@ -55,11 +50,7 @@ pub trait ExecutorBuilder<J: UnwindSafe, T> {
     /// configuring the builder, or if an error occurred while initializing
     /// the executor.
     fn build<
-        F: Fn(J, <Self::Executor as ExecutorCore<J>>::Handle<'_>) -> T
-            + Clone
-            + RefUnwindSafe
-            + Send
-            + 'static,
+        F: Fn(J, <Self::Executor as ExecutorCore<J>>::Handle<'_>) -> T + Clone + Send + 'static,
     >(
         self,
         work: F,
@@ -77,7 +68,7 @@ pub trait ExecutorHandle<J> {
 // TODO: check usages of atomic ordering
 
 /// Abstraction over a thread pool that executes jobs in a dependency-free queue
-pub trait ExecutorCore<J: UnwindSafe>: ExecutorHandle<J> + Sized {
+pub trait ExecutorCore<J>: ExecutorHandle<J> + Sized {
     /// The handle into this executor exposed to running jobs
-    type Handle<'a>: ExecutorHandle<J> + Copy + UnwindSafe + RefUnwindSafe + 'a;
+    type Handle<'a>: ExecutorHandle<J> + Copy + 'a;
 }
