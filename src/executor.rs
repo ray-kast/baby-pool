@@ -464,7 +464,8 @@ impl<J, R: Runtime + ?Sized> Drop for Executor<J, R> {
     fn drop(&mut self) { self.0.abort(); }
 }
 
-struct WorkerThread<J, R: Runtime + ?Sized> {
+#[derive(Debug)]
+pub struct WorkerThread<J, R: Runtime + ?Sized> {
     // Might expose in the future
     // index: usize,
     work: Worker<J>,

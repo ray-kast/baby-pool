@@ -8,6 +8,13 @@
 )]
 #![warn(clippy::pedantic, missing_docs)]
 #![allow(clippy::module_name_repetitions)]
+// TODO: document everything
+#![allow(
+    missing_docs,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::missing_safety_doc
+)]
 
 //! A tiny library for doing basic synchronous thread scheduling.
 //!
@@ -24,7 +31,7 @@
 
 pub mod executor;
 pub mod graph;
-pub mod nonblock;
+mod nonblock;
 
 pub mod prelude {
     //! Common traits
