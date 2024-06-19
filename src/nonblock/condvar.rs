@@ -1,3 +1,5 @@
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicBool;
 use std::{
     cell::{OnceCell, UnsafeCell},
     fmt,
@@ -135,9 +137,48 @@ impl WaitQueue {
     }
 }
 
+#[cfg_attr(not(debug_assertions), repr(transparent))]
+struct RawMutex(parking_lot::RawMutex, #[cfg(debug_assertions)] AtomicBool);
+
+impl RawMutex {
+    #[cfg(debug_assertions)]
+    #[inline]
+    const fn new() -> Self { Self(parking_lot::RawMutex::INIT, AtomicBool::new(false)) }
+
+    #[cfg(not(debug_assertions))]
+    #[inline]
+    const fn new() -> Self { Self(parking_lot::RawMutex::INIT) }
+
+    #[cfg(debug_assertions)]
+    fn try_lock(&self) -> bool {
+        if self.0.try_lock() {
+            self.1
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .unwrap_or_else(|_| panic!("Lock-after-lock on RawMutex"));
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn try_lock(&self) -> bool { self.0.try_lock() }
+
+    unsafe fn unlock(&self) {
+        #[cfg(debug_assertions)]
+        {
+            self.1
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .unwrap_or_else(|_| panic!("Unlock-after-unlock on RawMutex"));
+        }
+
+        self.0.unlock();
+    }
+}
+
 pub struct Mutex<T: ?Sized> {
     queue: WaitQueue,
-    raw: parking_lot::RawMutex,
+    raw: RawMutex,
     value: UnsafeCell<T>,
 }
 
@@ -176,7 +217,7 @@ impl<T> Mutex<T> {
     pub fn new(value: T) -> Self {
         Self {
             queue: WaitQueue::new(),
-            raw: parking_lot::RawMutex::INIT,
+            raw: RawMutex::new(),
             value: value.into(),
         }
     }
@@ -258,12 +299,7 @@ impl Condvar {
         }
 
         self.0.push().await;
-
-        assert!(
-            mutex.raw.try_lock(),
-            "Re-locking mutex for condition variable failed"
-        );
-        guard.0 = Some(mutex);
+        *guard = mutex.lock().await;
     }
 
     #[inline]
