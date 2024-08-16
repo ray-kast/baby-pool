@@ -65,17 +65,22 @@ impl Future for Park {
             .0
             .0
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |p| {
-                (p == Unpark::UNPOLLED)
+                (p != Unpark::UNPARKED)
                     .then(|| *waker.get_or_init(|| Unpark::box_waker(cx.waker().clone().into())))
             });
         match prev {
+            Ok(Unpark::UNPOLLED) => Poll::Pending,
+            Ok(Unpark::UNPARKED) => unreachable!("Incorrectly stored waker for unparked Park"),
             Ok(p) => {
-                debug_assert_eq!(p, Unpark::UNPOLLED);
+                drop(
+                    unsafe { Unpark::get_waker(p) }
+                        .unwrap_or_else(|| unreachable!("Failed to load old waker for Park")),
+                );
                 Poll::Pending
             },
-            Err(Unpark::UNPARKED) => Poll::Ready(()),
             Err(p) => {
-                unreachable!("Invalid unpark pointer {p:x?} encountered, this should not happen")
+                debug_assert_eq!(p, Unpark::UNPARKED);
+                Poll::Ready(())
             },
         }
     }
@@ -87,6 +92,162 @@ pub fn park() -> (Park, Weak<Unpark>) {
     let unpark_weak = Arc::downgrade(&unpark);
 
     (Park(unpark), unpark_weak)
+}
+
+#[cfg(test)]
+mod park_test {
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    };
+
+    use futures_util::FutureExt;
+
+    use crate::nonblock::condvar::Unpark;
+
+    #[derive(Clone, Default)]
+    #[repr(transparent)]
+    struct RawWake(Arc<AtomicBool>);
+
+    impl RawWake {
+        const VTABLE: RawWakerVTable =
+            RawWakerVTable::new(Self::clone, Self::wake, Self::wake_by_ref, Self::drop);
+
+        #[must_use]
+        unsafe fn acquire(ptr: *const ()) -> Self { Self(Arc::from_raw(ptr.cast())) }
+
+        unsafe fn clone(ptr: *const ()) -> RawWaker {
+            let me = Self::acquire(ptr);
+            let ret = me.clone();
+            me.release();
+            ret.into_raw_waker()
+        }
+
+        unsafe fn wake(ptr: *const ()) { drop(Self::acquire(ptr).wake_impl()); }
+
+        unsafe fn wake_by_ref(ptr: *const ()) { Self::acquire(ptr).wake_impl().release(); }
+
+        unsafe fn drop(ptr: *const ()) { drop(Self::acquire(ptr)); }
+
+        #[must_use]
+        fn wake_impl(self) -> Self {
+            self.0.store(true, Ordering::SeqCst);
+            self
+        }
+
+        fn release(self) -> *const () {
+            let Self(a) = self;
+            Arc::into_raw(a).cast()
+        }
+
+        fn into_raw_waker(self) -> RawWaker { RawWaker::new(self.release(), &Self::VTABLE) }
+
+        fn into_waker(self) -> Waker { unsafe { Waker::from_raw(self.into_raw_waker()) } }
+    }
+
+    #[test]
+    fn test_poll() {
+        let (mut park, unpark) = super::park();
+
+        let raw = RawWake::default();
+        let waker1 = raw.clone().into_waker();
+        let waker2 = raw.clone().into_waker();
+
+        assert!(
+            unpark
+                .upgrade()
+                .is_some_and(|u| { matches!(u.0.load(Ordering::SeqCst), Unpark::UNPOLLED) })
+        );
+
+        assert!(matches!(
+            park.poll_unpin(&mut Context::from_waker(&waker1)),
+            Poll::Pending
+        ));
+
+        assert!(unpark.upgrade().is_some_and(|u| {
+            !matches!(
+                u.0.load(Ordering::SeqCst),
+                Unpark::UNPOLLED | Unpark::UNPOLLED
+            )
+        }));
+
+        if let Some(u) = unpark.upgrade() {
+            u.unpark();
+        }
+
+        assert!(raw.0.load(Ordering::SeqCst));
+
+        assert!(
+            unpark
+                .upgrade()
+                .is_some_and(|u| { matches!(u.0.load(Ordering::SeqCst), Unpark::UNPARKED) })
+        );
+
+        assert!(matches!(
+            park.poll_unpin(&mut Context::from_waker(&waker2)),
+            Poll::Ready(())
+        ));
+    }
+
+    #[test]
+    fn test_multi_poll() {
+        let (mut park, unpark) = super::park();
+
+        let raw = RawWake::default();
+        let waker1 = raw.clone().into_waker();
+        let waker2 = raw.clone().into_waker();
+        let waker3 = raw.clone().into_waker();
+
+        assert!(
+            unpark
+                .upgrade()
+                .is_some_and(|u| { matches!(u.0.load(Ordering::SeqCst), Unpark::UNPOLLED) })
+        );
+
+        assert!(matches!(
+            park.poll_unpin(&mut Context::from_waker(&waker1)),
+            Poll::Pending
+        ));
+
+        assert!(unpark.upgrade().is_some_and(|u| {
+            !matches!(
+                u.0.load(Ordering::SeqCst),
+                Unpark::UNPOLLED | Unpark::UNPOLLED
+            )
+        }));
+
+        assert!(matches!(
+            park.poll_unpin(&mut Context::from_waker(&waker2)),
+            Poll::Pending
+        ));
+
+        assert!(unpark.upgrade().is_some_and(|u| {
+            !matches!(
+                u.0.load(Ordering::SeqCst),
+                Unpark::UNPOLLED | Unpark::UNPOLLED
+            )
+        }));
+
+        if let Some(u) = unpark.upgrade() {
+            u.unpark();
+        }
+
+        assert!(raw.0.load(Ordering::SeqCst));
+
+        assert!(
+            unpark
+                .upgrade()
+                .is_some_and(|u| { matches!(u.0.load(Ordering::SeqCst), Unpark::UNPARKED) })
+        );
+
+        assert!(matches!(
+            park.poll_unpin(&mut Context::from_waker(&waker3)),
+            Poll::Ready(())
+        ));
+    }
 }
 
 #[derive(Debug)]

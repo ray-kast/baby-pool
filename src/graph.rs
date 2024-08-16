@@ -58,8 +58,7 @@ use std::{
     marker::PhantomData,
     mem,
     mem::{ManuallyDrop, MaybeUninit},
-    ops,
-    ptr,
+    ops, ptr,
     sync::{
         atomic::{AtomicPtr, AtomicUsize, Ordering},
         Arc,
@@ -69,7 +68,10 @@ use std::{
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use thiserror::Error;
 
-use crate::{executor::{AsyncExecutor, Blocking, Executor, Nonblock}, prelude::*};
+use crate::{
+    executor::{AsyncExecutor, Blocking, Executor, Nonblock},
+    prelude::*,
+};
 
 /// The core interface for scheduling tasks with dependencies
 pub trait SchedulerCore<J>: ExecutorHandle<J> {

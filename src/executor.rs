@@ -1,8 +1,13 @@
 use std::{
-    error::Error, fmt::Debug, future::Future, marker::PhantomData, panic::AssertUnwindSafe, sync::{
+    error::Error,
+    fmt::Debug,
+    future::Future,
+    marker::PhantomData,
+    panic::AssertUnwindSafe,
+    sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
-    }
+    },
 };
 
 use crossbeam::deque::{Injector, Steal, Stealer, Worker};
@@ -114,8 +119,8 @@ impl<E: AsyncExecutor> Runtime for Nonblock<E> {
     fn notify_all(cvar: &Self::Condvar) -> usize { cvar.notify_all() }
 }
 
-impl<J: Send + 'static, T: Send + Future<Output = ()> + 'static, E: AsyncExecutor>
-    SpawnWorker<J, T> for Nonblock<E>
+impl<J: Send + 'static, T: Send + Future<Output = ()> + 'static, E: AsyncExecutor> SpawnWorker<J, T>
+    for Nonblock<E>
 {
     type Error = E::SpawnError;
 
@@ -143,7 +148,7 @@ impl AsyncExecutor for Tokio {
     #[inline]
     fn spawn<F: Future<Output = ()> + Send + 'static>(
         &self,
-        name: String,
+        _name: String,
         f: F,
     ) -> Result<Self::JoinHandle<()>, Self::SpawnError> {
         Ok(tokio::task::spawn(f))
@@ -198,17 +203,12 @@ impl<J, R> Builder<J, R> {
 
 // TODO: remove usages of impl Trait where it muddies the API
 
-impl<J: Send + 'static, T, R: SpawnWorker<J, T> + 'static> ExecutorBuilder<J, T>
-    for Builder<J, R>
-{
+impl<J: Send + 'static, T, R: SpawnWorker<J, T> + 'static> ExecutorBuilder<J, T> for Builder<J, R> {
     type Error = R::Error;
     type Executor = Executor<J, R>;
 
     fn build<
-        F: Fn(J, <Self::Executor as ExecutorCore<J>>::Handle<'_>) -> T
-            + Clone
-            + Send
-            + 'static,
+        F: Fn(J, <Self::Executor as ExecutorCore<J>>::Handle<'_>) -> T + Clone + Send + 'static,
     >(
         self,
         f: F,
@@ -422,9 +422,7 @@ impl<J, R: Runtime + ?Sized> ExecutorHandle<J> for Executor<J, R> {
     fn push(&self, job: J) { self.0.push(job); }
 }
 
-impl<J: Send + 'static, R: Runtime + ?Sized + 'static> ExecutorCore<J>
-    for Executor<J, R>
-{
+impl<J: Send + 'static, R: Runtime + ?Sized + 'static> ExecutorCore<J> for Executor<J, R> {
     type Handle<'a> = Handle<'a, J, R>;
 }
 
