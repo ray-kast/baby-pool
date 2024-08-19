@@ -17,6 +17,7 @@ use futures_util::FutureExt;
 use crate::{
     nonblock::{condvar, unwind::AbortOnPanic},
     prelude::*,
+    AsyncHandler, ExecutorBuilder,
 };
 
 // TODO: check all trait bounds to see what can be relaxed
@@ -28,6 +29,8 @@ pub trait Runtime {
 
     type JoinHandle<T: Send>: Send;
 
+    type SpawnError: Error;
+
     fn new_mutex<T: Debug + Send>(value: T) -> Self::Mutex<T>;
 
     fn new_condvar() -> Self::Condvar;
@@ -37,15 +40,13 @@ pub trait Runtime {
     fn notify_all(cvar: &Self::Condvar) -> usize;
 }
 
-pub trait SpawnWorker<J, T>: Runtime + Sized {
-    type Error: Error;
-
-    fn spawn_worker<F: Fn(J, Handle<J, Self>) -> T + Send + 'static>(
+pub trait SpawnWorker<J, F>: Runtime + Sized {
+    fn spawn_worker(
         &self,
         name: String,
         worker: WorkerThread<J, Self>,
         f: F,
-    ) -> Result<Self::JoinHandle<()>, Self::Error>;
+    ) -> Result<Self::JoinHandle<()>, Self::SpawnError>;
 }
 
 pub trait AsyncExecutor: Send + Sync + 'static {
@@ -72,6 +73,7 @@ impl Runtime for Blocking {
     type Condvar = parking_lot::Condvar;
     type JoinHandle<T: Send> = std::thread::JoinHandle<T>;
     type Mutex<T: Debug + Send> = parking_lot::Mutex<T>;
+    type SpawnError = std::io::Error;
 
     #[inline]
     fn new_mutex<T: Debug + Send>(value: T) -> Self::Mutex<T> { parking_lot::Mutex::new(value) }
@@ -86,15 +88,13 @@ impl Runtime for Blocking {
     fn notify_all(cvar: &Self::Condvar) -> usize { cvar.notify_all() }
 }
 
-impl<J: Send + 'static> SpawnWorker<J, ()> for Blocking {
-    type Error = std::io::Error;
-
-    fn spawn_worker<F: Fn(J, Handle<J, Self>) + Send + 'static>(
+impl<J: Send + 'static, F: Fn(J, Handle<J, Self>) + Send + 'static> SpawnWorker<J, F> for Blocking {
+    fn spawn_worker(
         &self,
         name: String,
         worker: WorkerThread<J, Self>,
         f: F,
-    ) -> Result<Self::JoinHandle<()>, Self::Error> {
+    ) -> Result<Self::JoinHandle<()>, Self::SpawnError> {
         std::thread::Builder::new()
             .name(name)
             .spawn(move || worker.run_sync(f))
@@ -108,6 +108,7 @@ impl<E: AsyncExecutor> Runtime for Nonblock<E> {
     type Condvar = condvar::Condvar;
     type JoinHandle<T: Send> = E::JoinHandle<T>;
     type Mutex<T: Debug + Send> = condvar::Mutex<T>;
+    type SpawnError = E::SpawnError;
 
     #[inline]
     fn new_mutex<T: Debug + Send>(value: T) -> Self::Mutex<T> { condvar::Mutex::new(value) }
@@ -119,18 +120,19 @@ impl<E: AsyncExecutor> Runtime for Nonblock<E> {
     fn notify_all(cvar: &Self::Condvar) -> usize { cvar.notify_all() }
 }
 
-impl<J: Send + 'static, T: Send + Future<Output = ()> + 'static, E: AsyncExecutor> SpawnWorker<J, T>
-    for Nonblock<E>
+impl<
+    J: Send + 'static,
+    E: AsyncExecutor,
+    F: for<'h> AsyncHandler<J, Handle<'h, J, Nonblock<E>>, Output = ()> + Send + 'static,
+> SpawnWorker<J, F> for Nonblock<E>
 {
-    type Error = E::SpawnError;
-
     #[inline]
-    fn spawn_worker<F: Fn(J, Handle<J, Self>) -> T + Send + 'static>(
+    fn spawn_worker(
         &self,
         name: String,
         worker: WorkerThread<J, Self>,
         f: F,
-    ) -> Result<Self::JoinHandle<()>, Self::Error> {
+    ) -> Result<Self::JoinHandle<()>, Self::SpawnError> {
         self.0.spawn(name, worker.run_async(f))
     }
 }
@@ -203,16 +205,15 @@ impl<J, R> Builder<J, R> {
 
 // TODO: remove usages of impl Trait where it muddies the API
 
-impl<J: Send + 'static, T, R: SpawnWorker<J, T> + 'static> ExecutorBuilder<J, T> for Builder<J, R> {
-    type Error = R::Error;
+impl<J: Send + 'static, R: Runtime + 'static> ExecutorBuilderCore<J> for Builder<J, R> {
+    type Error = R::SpawnError;
     type Executor = Executor<J, R>;
+}
 
-    fn build<
-        F: Fn(J, <Self::Executor as ExecutorCore<J>>::Handle<'_>) -> T + Clone + Send + 'static,
-    >(
-        self,
-        f: F,
-    ) -> Result<Executor<J, R>, R::Error> {
+impl<J: Send + 'static, R: SpawnWorker<J, F> + 'static, F: Clone> ExecutorBuilder<J, F>
+    for Builder<J, R>
+{
+    fn build(self, f: F) -> Result<Executor<J, R>, R::SpawnError> {
         let Self {
             lifo,
             num_threads,
@@ -517,16 +518,41 @@ impl<J> WorkerThread<J, Blocking> {
     }
 }
 
-impl<J: Send, E: AsyncExecutor> WorkerThread<J, Nonblock<E>> {
-    fn run_async<F: Future<Output = ()> + Send>(
+impl<J: Send + 'static> ExecutorBuilderSync<J> for Builder<J, Blocking> {
+    #[inline]
+    fn build<F: Fn(J, <Self::Executor as ExecutorCore<J>>::Handle<'_>) + Clone + Send + 'static>(
         self,
-        f: impl Fn(J, Handle<J, Nonblock<E>>) -> F + Send,
+        work: F,
+    ) -> Result<Self::Executor, Self::Error> {
+        ExecutorBuilder::build(self, work)
+    }
+}
+
+impl<J: Send + 'static, E: AsyncExecutor> ExecutorBuilderAsync<J> for Builder<J, Nonblock<E>> {
+    #[inline]
+    fn build_async<
+        F: for<'h> AsyncHandler<J, <Self::Executor as ExecutorCore<J>>::Handle<'h>, Output = ()>
+            + Clone
+            + Send
+            + 'static,
+    >(
+        self,
+        work: F,
+    ) -> Result<Self::Executor, Self::Error> {
+        ExecutorBuilder::build(self, work)
+    }
+}
+
+impl<J: Send, E: AsyncExecutor> WorkerThread<J, Nonblock<E>> {
+    fn run_async<F: for<'h> AsyncHandler<J, Handle<'h, J, Nonblock<E>>, Output = ()> + Send>(
+        self,
+        f: F,
     ) -> impl Future<Output = ()> + Send {
         AbortOnPanic(async move {
             while !self.core.stop.load(Ordering::Acquire) {
                 let handle = Handle(&self.core);
                 if let Some(job) = self.get_job() {
-                    match AssertUnwindSafe(f(job, handle)).catch_unwind().await {
+                    match AssertUnwindSafe(f.handle(job, handle)).catch_unwind().await {
                         Ok(()) => (),
                         Err(e) => log::error!("Job panicked: {:?}", e),
                     }

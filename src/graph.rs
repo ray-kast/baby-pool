@@ -71,10 +71,11 @@ use thiserror::Error;
 use crate::{
     executor::{AsyncExecutor, Blocking, Executor, Nonblock},
     prelude::*,
+    AsyncHandler,
 };
 
 /// The core interface for scheduling tasks with dependencies
-pub trait SchedulerCore<J>: ExecutorHandle<J> {
+pub trait SchedulerCore<J> {
     /// Create a pending job
     ///
     /// # Panics
@@ -612,18 +613,16 @@ impl<J, H: ExecutorHandle<Job<J>>> ExecutorHandle<J> for Handle<H> {
     fn push(&self, job: J) { self.0.push(job.into()); }
 }
 
-impl<J, E: ExecutorCore<Job<J>>> Scheduler<J, E>
-where for<'a> E::Handle<'a>: Clone
-{
+impl<J, E: ExecutorCore<Job<J>>> Scheduler<J, E> {
     /// Construct a new graph scheduler
     fn new<
-        B: ExecutorBuilder<Job<J>, (), Executor = E>,
+        B: ExecutorBuilderSync<Job<J>, Executor = E>,
         F: Fn(J, Handle<E::Handle<'_>>) -> Result<(), ()> + Clone + Send + 'static,
     >(
         b: B,
         f: F,
     ) -> Result<Self, B::Error> {
-        let executor = b.build(
+        b.build(
             move |Job {
                       payload,
                       dependents,
@@ -643,9 +642,60 @@ where for<'a> E::Handle<'a>: Clone
                     Err(()) => (),
                 }
             },
-        )?;
+        )
+        .map(|executor| Self {
+            executor,
+            _m: PhantomData,
+        })
+    }
+}
 
-        Ok(Self {
+impl<J: Send, E: ExecutorCore<Job<J>>> Scheduler<J, E>
+where for<'a> E::Handle<'a>: Send
+{
+    fn new_async<
+        B: ExecutorBuilderAsync<Job<J>, Executor = E>,
+        F: for<'h> AsyncHandler<J, Handle<E::Handle<'h>>, Output = Result<(), ()>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    >(
+        b: B,
+        f: F,
+    ) -> Result<Self, B::Error> {
+        #[derive(Clone)]
+        struct Handler<F>(F);
+        impl<
+            J: Send,
+            H: ExecutorHandle<Job<J>> + Copy + Send,
+            F: AsyncHandler<J, Handle<H>, Output = Result<(), ()>> + Sync,
+        > AsyncHandler<Job<J>, H> for Handler<F>
+        {
+            type Output = ();
+
+            async fn handle(&self, job: Job<J>, handle: H) {
+                let Job {
+                    payload,
+                    dependents,
+                } = job;
+                let handle = Handle(handle);
+
+                #[allow(clippy::single_match)]
+                match self.0.handle(payload, handle).await {
+                    Ok(()) => {
+                        if let Some(dependents) = dependents {
+                            for dep in mem::take(&mut *dependents.0.write()).into_iter().flatten() {
+                                dep.to.decrement(&handle);
+                            }
+                        }
+                    },
+                    Err(()) => (),
+                }
+            }
+        }
+
+        b.build_async(Handler(f)).map(|executor| Self {
             executor,
             _m: PhantomData,
         })
@@ -658,38 +708,52 @@ impl<J, E> std::ops::Deref for Scheduler<J, E> {
     fn deref(&self) -> &E { &self.executor }
 }
 
-impl<J, E> std::ops::DerefMut for Scheduler<J, E> {
-    fn deref_mut(&mut self) -> &mut E { &mut self.executor }
-}
-
 /// Adds the [`build_graph`](ExecutorBuilderExt::build_graph) method to
 /// [`ExecutorBuilder`]
-pub trait ExecutorBuilderExt<J>: Sized + ExecutorBuilder<Job<J>, ()> {
+pub trait ExecutorBuilderExt<J>: Sized + ExecutorBuilderCore<Job<J>> {
     // TODO: remove this impl Fn
     /// Construct a new graph scheduler using this builder's executor type
     ///
     /// # Errors
     /// This method fails if the underlying executor fails to build.
-    fn build_graph(
+    fn build_graph<
+        F: Fn(J, Handle<<Self::Executor as ExecutorCore<Job<J>>>::Handle<'_>>) -> Result<(), ()>
+            + Clone
+            + Send
+            + 'static,
+    >(
         self,
-        work: impl Fn(J, Handle<<Self::Executor as ExecutorCore<Job<J>>>::Handle<'_>>) -> Result<(), ()>
-        + Send
-        + Clone
-        + 'static,
-    ) -> Result<Scheduler<J, Self::Executor>, Self::Error>;
-}
-
-impl<J, B: ExecutorBuilder<Job<J>, ()> + Sized> ExecutorBuilderExt<J> for B {
-    fn build_graph(
-        self,
-        work: impl Fn(J, Handle<<B::Executor as ExecutorCore<Job<J>>>::Handle<'_>>) -> Result<(), ()>
-        + Send
-        + Clone
-        + 'static,
-    ) -> Result<Scheduler<J, B::Executor>, Self::Error> {
+        work: F,
+    ) -> Result<Scheduler<J, Self::Executor>, Self::Error>
+    where
+        Self: ExecutorBuilderSync<Job<J>>,
+    {
         Scheduler::new(self, work)
     }
+
+    fn build_graph_async<
+        F: for<'h> AsyncHandler<
+                J,
+                Handle<<Self::Executor as ExecutorCore<Job<J>>>::Handle<'h>>,
+                Output = Result<(), ()>,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+    >(
+        self,
+        work: F,
+    ) -> Result<Scheduler<J, Self::Executor>, Self::Error>
+    where
+        J: Send,
+        Self: ExecutorBuilderAsync<Job<J>>,
+        for<'a> <Self::Executor as ExecutorCore<Job<J>>>::Handle<'a>: Send,
+    {
+        Scheduler::new_async(self, work)
+    }
 }
+
+impl<J, B: ExecutorBuilderCore<Job<J>> + Sized> ExecutorBuilderExt<J> for B {}
 
 impl<J, E: ExecutorCore<Job<J>>> ExecutorHandle<J> for Scheduler<J, E> {
     #[inline]
@@ -700,7 +764,7 @@ impl<J, E: ExecutorCore<Job<J>>> ExecutorCore<J> for Scheduler<J, E> {
     type Handle<'a> = Handle<E::Handle<'a>>;
 }
 
-impl<J: Send + 'static> Scheduler<J, Executor<J, Blocking>> {
+impl<J: Send + 'static> Scheduler<J, Executor<Job<J>, Blocking>> {
     #[inline]
     pub fn join(self) { self.executor.join(); }
 
@@ -708,7 +772,7 @@ impl<J: Send + 'static> Scheduler<J, Executor<J, Blocking>> {
     pub fn abort(self) { self.executor.abort(); }
 }
 
-impl<J: Send + 'static, E: AsyncExecutor> Scheduler<J, Executor<J, Nonblock<E>>> {
+impl<J: Send + 'static, E: AsyncExecutor> Scheduler<J, Executor<Job<J>, Nonblock<E>>> {
     #[inline]
     pub fn join_async(self) -> impl std::future::Future<Output = ()> + Send {
         self.executor.join_async()
