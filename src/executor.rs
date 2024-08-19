@@ -168,7 +168,7 @@ impl AsyncExecutor for Tokio {
 #[derive(Clone, Copy, Debug)]
 pub struct Builder<J, R> {
     lifo: bool,
-    num_threads: Option<usize>,
+    max_concurrency: Option<usize>,
     runtime: R,
     phantom: PhantomData<fn(J)>,
 }
@@ -182,7 +182,7 @@ impl<J, R> Builder<J, R> {
     pub fn new(runtime: R) -> Self {
         Self {
             lifo: false,
-            num_threads: None,
+            max_concurrency: None,
             runtime,
             phantom: PhantomData,
         }
@@ -197,8 +197,8 @@ impl<J, R> Builder<J, R> {
 
     /// Specify the number of threads to use, or None to detect from `num_cpus`.
     #[must_use]
-    pub fn num_threads(mut self, num: impl Into<Option<usize>>) -> Self {
-        self.num_threads = num.into();
+    pub fn max_concurrency(mut self, num: impl Into<Option<usize>>) -> Self {
+        self.max_concurrency = num.into();
         self
     }
 }
@@ -216,14 +216,14 @@ impl<J: Send + 'static, R: SpawnWorker<J, F> + 'static, F: Clone> ExecutorBuilde
     fn build(self, f: F) -> Result<Executor<J, R>, R::SpawnError> {
         let Self {
             lifo,
-            num_threads,
+            max_concurrency,
             runtime,
             phantom: _,
         } = self;
 
-        let num_threads = num_threads.unwrap_or_else(num_cpus::get);
+        let max_concurrency = max_concurrency.unwrap_or_else(num_cpus::get);
 
-        let work = (0..num_threads)
+        let work = (0..max_concurrency)
             .map(|i| {
                 (
                     i,
@@ -246,7 +246,7 @@ impl<J: Send + 'static, R: SpawnWorker<J, F> + 'static, F: Clone> ExecutorBuilde
             inj: Injector::new(),
             steal,
             stop: AtomicBool::new(false),
-            live: R::new_mutex(num_threads),
+            live: R::new_mutex(max_concurrency),
             unpark_var: R::new_condvar(),
             join_var: R::new_condvar(),
         });
@@ -397,9 +397,9 @@ impl<'a, J, R: Runtime + ?Sized> ExecutorHandle<J> for Handle<'a, J, R> {
 }
 
 impl<J, R: Runtime + ?Sized> Executor<J, R> {
-    /// Get the number of threads created for this executor
+    /// Get the number of tasks created for this executor
     #[must_use]
-    pub fn num_threads(&self) -> usize { self.1.len() }
+    pub fn max_concurrency(&self) -> usize { self.1.len() }
 }
 
 impl<J> Executor<J, Blocking> {
