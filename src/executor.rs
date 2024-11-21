@@ -1,3 +1,27 @@
+//! Functionality for constructing and running work-queue executors
+//!
+//! This module exposes the [`Executor`] type, which can be built from
+//! [`Blocking`] or [`Nonblock`] runtime tags using [`Executor::builder`].
+//!
+//! # Example
+//!
+//! ```
+//! # use topograph::{prelude::*, executor};
+//! struct Job(&'static str);
+//!
+//! let pool = executor::Builder::new(executor::Blocking).build(|job, handle| {
+//!     let Job(job) = job;
+//!     println!("{}", job);
+//! }).unwrap();
+//!
+//! pool.push(Job("foo"));
+//! pool.push(Job("bar"));
+//! pool.push(Job("baz"));
+//! ```
+//!
+//! The above code will print `foo`, `bar`, and `baz`, but not in any
+//! guaranteed order as the jobs may be dequeued in parallel.
+
 use std::{
     error::Error,
     fmt::Debug,
@@ -22,25 +46,45 @@ use crate::{
 
 // TODO: check all trait bounds to see what can be relaxed
 
+/// A minimal description of a concurrent runtime that can host `topograph`.
+/// This trait is designed to be consumed internally by `topograph`'s thread
+/// scheduler.
 pub trait Runtime {
+    /// The mutex type compatible with this runtime
     // TODO: dumb issue with bounds and Debug requirements
     type Mutex<T: Debug + Send>: Debug + Send + Sync;
+    /// The condition variable type compatible with this runtime
     type Condvar: Debug + Send + Sync;
 
+    /// The type of handle returned by tasks spawned into this runtime
     type JoinHandle<T: Send>: Send;
 
+    /// The type of error that may be returned when spawning tasks into this
+    /// runtime
     type SpawnError: Error;
 
+    /// Construct a new mutex for this runtime with the given value
     fn new_mutex<T: Debug + Send>(value: T) -> Self::Mutex<T>;
 
+    /// Construct a new condition variable for this runtime
     fn new_condvar() -> Self::Condvar;
 
+    /// Notify a single waiter on the given condition variable to wake
     fn notify_one(cvar: &Self::Condvar) -> bool;
 
+    /// Notify all waiters on the given condition variable to wake
     fn notify_all(cvar: &Self::Condvar) -> usize;
 }
 
+/// A minimal description of a concurrent runtime that can spawn worker tasks
+/// for `topograph`
 pub trait SpawnWorker<J, F>: Runtime + Sized {
+    /// Spawn a new task to run the given worker with the given user-provided
+    /// task
+    ///
+    /// # Errors
+    /// This function may return an error if a task was unable to be spawned in
+    /// the runtime
     fn spawn_worker(
         &self,
         name: String,
@@ -49,23 +93,38 @@ pub trait SpawnWorker<J, F>: Runtime + Sized {
     ) -> Result<Self::JoinHandle<()>, Self::SpawnError>;
 }
 
+/// A minimal description of the interface required to spawn and join tasks
+/// running on an async executor
 pub trait AsyncExecutor: Send + Sync + 'static {
+    /// The type of error that may be returned when spawning a task
     type SpawnError: Error;
 
+    /// The type of handle returned by a spawned task
     type JoinHandle<T: Send>: Send;
+    /// The type of error that may be returned when joining a task
     type JoinError: Error;
 
+    /// Spawn a new asynchronous task returning unit
+    ///
+    /// # Errors
+    /// This function may return an error if the async runtime could not spawn
+    /// the task
     fn spawn<F: Future<Output = ()> + Send + 'static>(
         &self,
         name: String,
         f: F,
     ) -> Result<Self::JoinHandle<()>, Self::SpawnError>;
 
+    /// Join a running task, blocking until it completes
+    ///
+    /// # Errors
+    /// This function may return an error if the task to be joined panicked
     fn join<T: Send>(
         handle: Self::JoinHandle<T>,
     ) -> impl Future<Output = Result<T, Self::JoinError>> + Send;
 }
 
+/// Runtime traits for spawning a blocking [`Executor`]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Blocking;
 
@@ -101,6 +160,8 @@ impl<J: Send + 'static, F: Fn(J, Handle<J, Self>) + Send + 'static> SpawnWorker<
     }
 }
 
+/// Runtime traits for spawning a non-blocking [`Executor`] given an
+/// [async executor](AsyncExecutor)
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Nonblock<E>(pub E);
 
@@ -121,10 +182,10 @@ impl<E: AsyncExecutor> Runtime for Nonblock<E> {
 }
 
 impl<
-    J: Send + 'static,
-    E: AsyncExecutor,
-    F: for<'h> AsyncHandler<J, Handle<'h, J, Nonblock<E>>, Output = ()> + Send + 'static,
-> SpawnWorker<J, F> for Nonblock<E>
+        J: Send + 'static,
+        E: AsyncExecutor,
+        F: for<'h> AsyncHandler<J, Handle<'h, J, Nonblock<E>>, Output = ()> + Send + 'static,
+    > SpawnWorker<J, F> for Nonblock<E>
 {
     #[inline]
     fn spawn_worker(
@@ -138,6 +199,7 @@ impl<
 }
 
 #[cfg(feature = "tokio")]
+/// Runtime traits for spawning tasks on a Tokio runtime
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Tokio;
 
@@ -179,6 +241,8 @@ impl<J, R: Default> Default for Builder<J, R> {
 }
 
 impl<J, R> Builder<J, R> {
+    /// Construct a new executor builder with the given runtime and default
+    /// FIFO configuration
     pub fn new(runtime: R) -> Self {
         Self {
             lifo: false,
@@ -295,8 +359,8 @@ struct Core<J, R: Runtime + ?Sized> {
 #[derive(Debug)]
 pub struct Handle<'a, J, R: Runtime + ?Sized>(&'a Arc<Core<J, R>>);
 
-impl<'a, J, R: Runtime + ?Sized> Copy for Handle<'a, J, R> {}
-impl<'a, J, R: Runtime + ?Sized> Clone for Handle<'a, J, R> {
+impl<J, R: Runtime + ?Sized> Copy for Handle<'_, J, R> {}
+impl<J, R: Runtime + ?Sized> Clone for Handle<'_, J, R> {
     fn clone(&self) -> Self { *self }
 }
 
@@ -308,6 +372,8 @@ impl<'a, J, R: Runtime + ?Sized> Clone for Handle<'a, J, R> {
 pub struct Executor<J, R: Runtime + ?Sized>(Arc<Core<J, R>>, Vec<R::JoinHandle<()>>);
 
 impl<J, R: Runtime> Executor<J, R> {
+    /// Construct a new executor builder with the given runtime and default
+    /// FIFO configuration
     #[inline]
     pub fn builder(runtime: R) -> Builder<J, R> { Builder::new(runtime) }
 }
@@ -391,7 +457,7 @@ impl<J, E: AsyncExecutor> Core<J, Nonblock<E>> {
     }
 }
 
-impl<'a, J, R: Runtime + ?Sized> ExecutorHandle<J> for Handle<'a, J, R> {
+impl<J, R: Runtime + ?Sized> ExecutorHandle<J> for Handle<'_, J, R> {
     #[inline]
     fn push(&self, job: J) { self.0.push(job); }
 }
@@ -428,14 +494,20 @@ impl<J: Send + 'static, R: Runtime + ?Sized + 'static> ExecutorCore<J> for Execu
 }
 
 impl<J: Send + 'static> Executor<J, Blocking> {
+    /// Disable pushing new jobs and wait for all pending work to complete,
+    /// including jobs queued by currently-running jobs
     pub fn join(mut self) {
         self.0.join_sync();
         self.join_handles_sync();
 
         // Final sanity check
-        assert!(self.0.is_empty(), "Thread pool starved!");
+        if !self.0.is_empty() {
+            unreachable!("Thread pool starved!");
+        }
     }
 
+    /// Disable pushing new jobs and wait for all currently-running jobs to
+    /// finish before dropping the rest
     #[inline]
     pub fn abort(mut self) {
         self.0.abort();
@@ -444,14 +516,21 @@ impl<J: Send + 'static> Executor<J, Blocking> {
 }
 
 impl<J: Send + 'static, E: AsyncExecutor> Executor<J, Nonblock<E>> {
+    /// Returns a future that disables pushing new jobs and yields after all
+    /// pending work has completed, including jobs queued by currently-running
+    /// jobs
     pub async fn join_async(mut self) {
         self.0.join_async().await;
         self.join_handles_async().await;
 
         // Final sanity check
-        assert!(self.0.is_empty(), "Thread pool starved!");
+        if !self.0.is_empty() {
+            unreachable!("Thread pool starved!");
+        }
     }
 
+    /// Returns a future that disables pushing new jobs and yields after all
+    /// currently-running jobs have finished, dropping the rest
     #[inline]
     pub async fn abort_async(mut self) {
         self.0.abort();
@@ -463,6 +542,8 @@ impl<J, R: Runtime + ?Sized> Drop for Executor<J, R> {
     fn drop(&mut self) { self.0.abort(); }
 }
 
+/// A description of a single `topograph` worker task.  This struct is intended
+/// to be used internally or through the [`SpawnWorker`] trait
 #[derive(Debug)]
 pub struct WorkerThread<J, R: Runtime + ?Sized> {
     // Might expose in the future

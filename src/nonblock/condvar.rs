@@ -408,7 +408,7 @@ impl<'a, T: ?Sized> MutexGuard<'a, T> {
     pub fn unlock(self) { drop(self); }
 }
 
-impl<'a, T: ?Sized> Drop for MutexGuard<'a, T> {
+impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
         if let Some(mutex) = self.0 {
             // SAFETY: the mutex must have been locked by the call to lock that
@@ -419,7 +419,7 @@ impl<'a, T: ?Sized> Drop for MutexGuard<'a, T> {
     }
 }
 
-impl<'a, T> std::ops::Deref for MutexGuard<'a, T> {
+impl<T> std::ops::Deref for MutexGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -428,7 +428,7 @@ impl<'a, T> std::ops::Deref for MutexGuard<'a, T> {
     }
 }
 
-impl<'a, T> std::ops::DerefMut for MutexGuard<'a, T> {
+impl<T> std::ops::DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // SAFETY: the mutex has been locked if the guard is live
         unsafe { &mut *self.mutex().value.get() }

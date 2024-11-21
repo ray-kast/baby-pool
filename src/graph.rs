@@ -1,8 +1,11 @@
-//! A concurrent implementation of toposort for handling task dependencies.
+//! A concurrent implementation of topological sort (toposort, for short) for
+//! handling task dependencies
 //!
 //! This module is designed to parallelize operations on a dependency graph
 //! where some tasks must be delayed until all dependencies are met, such as in
 //! the following case:
+//!
+//! # Example
 //!
 //! ```
 //! # use topograph::{prelude::*, executor, graph};
@@ -50,8 +53,8 @@
 //! processed until `Bar` and `Baz` complete.
 //!
 //! Additionally, since dependent tasks should only run if all dependencies
-//! succeed, this module alters the worker function to allow returning a simple
-//! `Result` value.
+//! succeed, this module alters the worker task type passed to the underlying
+//! executor to allow returning a simple `Result` value.
 
 use std::{
     cell::UnsafeCell,
@@ -65,6 +68,7 @@ use std::{
     },
 };
 
+// TODO: verify all usages of these are async-safe
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use thiserror::Error;
 
@@ -211,7 +215,7 @@ pub struct Handle<H>(H);
 #[derive(Debug)]
 pub struct Scheduler<J, E> {
     executor: E,
-    _m: PhantomData<J>,
+    _m: PhantomData<fn(J)>,
 }
 
 // Rationale: J can only be accessed by the last dependency as it polls this
@@ -318,7 +322,7 @@ impl<J> NodeBuilder<J> {
     /// Request a single inbound edge (dependency), returning `None` if no more
     /// are available.
     pub fn try_get_in_edge(&mut self) -> Option<Edge<J>> {
-        if self.remaining > 0 && self.node.is_none() {
+        if (self.remaining == 0) != self.node.is_none() {
             unreachable!();
         }
 
@@ -340,9 +344,9 @@ impl<J> NodeBuilder<J> {
     /// Add a list of dependents to this node.
     ///
     /// # Errors
-    /// This function returns an error if the node is no longer available to be
-    /// accessed safely or if a dependent list has already been assigned to the
-    /// node.
+    /// This function returns the input dependent list as an error if the node
+    /// is no longer available to be accessed safely or if a dependent list has
+    /// already been assigned to the node.
     pub fn set_dependents(
         &mut self, // NOTE: this mut is IMPORTANT!
         dependents: Arc<Dependents<J>>,
@@ -613,6 +617,25 @@ impl<J, H: ExecutorHandle<Job<J>>> ExecutorHandle<J> for Handle<H> {
     fn push(&self, job: J) { self.0.push(job.into()); }
 }
 
+/// The `Copy` bound on `H` is to make clippy shut up
+fn process_result<J, H: ExecutorHandle<Job<J>> + Copy>(
+    res: Result<(), ()>,
+    handle: Handle<H>,
+    dependents: OptRcDependents<J>,
+) {
+    #[allow(clippy::single_match)]
+    match res {
+        Ok(()) => {
+            if let Some(dependents) = dependents {
+                for dep in mem::take(&mut *dependents.0.write()).into_iter().flatten() {
+                    dep.to.decrement(&handle);
+                }
+            }
+        },
+        Err(()) => (),
+    }
+}
+
 impl<J, E: ExecutorCore<Job<J>>> Scheduler<J, E> {
     /// Construct a new graph scheduler
     fn new<
@@ -630,17 +653,8 @@ impl<J, E: ExecutorCore<Job<J>>> Scheduler<J, E> {
                   handle| {
                 let handle = Handle(handle);
 
-                #[allow(clippy::single_match)]
-                match f(payload, handle) {
-                    Ok(()) => {
-                        if let Some(dependents) = dependents {
-                            for dep in mem::take(&mut *dependents.0.write()).into_iter().flatten() {
-                                dep.to.decrement(&handle);
-                            }
-                        }
-                    },
-                    Err(()) => (),
-                }
+                let res = f(payload, handle);
+                process_result(res, handle, dependents);
             },
         )
         .map(|executor| Self {
@@ -681,17 +695,8 @@ where for<'a> E::Handle<'a>: Send
                 } = job;
                 let handle = Handle(handle);
 
-                #[allow(clippy::single_match)]
-                match self.0.handle(payload, handle).await {
-                    Ok(()) => {
-                        if let Some(dependents) = dependents {
-                            for dep in mem::take(&mut *dependents.0.write()).into_iter().flatten() {
-                                dep.to.decrement(&handle);
-                            }
-                        }
-                    },
-                    Err(()) => (),
-                }
+                let res = self.0.handle(payload, handle).await;
+                process_result(res, handle, dependents);
             }
         }
 
@@ -709,10 +714,10 @@ impl<J, E> std::ops::Deref for Scheduler<J, E> {
 }
 
 /// Adds the [`build_graph`](ExecutorBuilderExt::build_graph) method to
-/// [`ExecutorBuilder`]
+/// [`ExecutorBuilderCore`]
 pub trait ExecutorBuilderExt<J>: Sized + ExecutorBuilderCore<Job<J>> {
-    // TODO: remove this impl Fn
-    /// Construct a new graph scheduler using this builder's executor type
+    /// Construct a new synchronous graph scheduler using this builder's
+    /// executor type
     ///
     /// # Errors
     /// This method fails if the underlying executor fails to build.
@@ -731,6 +736,11 @@ pub trait ExecutorBuilderExt<J>: Sized + ExecutorBuilderCore<Job<J>> {
         Scheduler::new(self, work)
     }
 
+    /// Construct a new asynchronous graph scheduler using this builder's
+    /// executor type
+    ///
+    /// # Errors
+    /// This method fails if the underlying executor fails to build.
     fn build_graph_async<
         F: for<'h> AsyncHandler<
                 J,
@@ -765,19 +775,28 @@ impl<J, E: ExecutorCore<Job<J>>> ExecutorCore<J> for Scheduler<J, E> {
 }
 
 impl<J: Send + 'static> Scheduler<J, Executor<Job<J>, Blocking>> {
+    /// Disable pushing new jobs and wait for all pending work to complete,
+    /// including jobs queued by currently-running jobs
     #[inline]
     pub fn join(self) { self.executor.join(); }
 
+    /// Disable pushing new jobs and wait for all currently-running jobs to
+    /// finish before dropping the rest
     #[inline]
     pub fn abort(self) { self.executor.abort(); }
 }
 
 impl<J: Send + 'static, E: AsyncExecutor> Scheduler<J, Executor<Job<J>, Nonblock<E>>> {
+    /// Returns a future that disables pushing new jobs and yields after all
+    /// pending work has completed, including jobs queued by currently-running
+    /// jobs
     #[inline]
     pub fn join_async(self) -> impl std::future::Future<Output = ()> + Send {
         self.executor.join_async()
     }
 
+    /// Returns a future that disables pushing new jobs and yields after all
+    /// currently-running jobs have finished, dropping the rest
     #[inline]
     pub fn abort_async(self) -> impl std::future::Future<Output = ()> + Send {
         self.executor.abort_async()

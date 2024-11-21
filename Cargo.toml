@@ -15,7 +15,7 @@ categories = ["algorithms", "concurrency", "rust-patterns"]
 
 [dependencies]
 crossbeam = "0.8.1"
-dispose = "0.4.0"
+dispose = "0.5.1"
 futures-util = "0.3.30"
 log = "0.4.14"
 num_cpus = "1.13.0"
